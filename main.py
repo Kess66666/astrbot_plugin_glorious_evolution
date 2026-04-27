@@ -3,7 +3,7 @@
 融合 MIA 智能记忆框架与自改进机制的进化系统
 
 三层架构（v1.0.0 Full MIA）：
-  Memory    → storage.py + memory_manager.py  (SQLite + 向量索引 + 胜率)
+  Memory    → storage.py + memory_manager.py  (SQLite + 向量索引 + 胜率 + 自动分类)
   Reasoning → reasoning_engine.py            (Plan → Judge → Replan)
   Evolution → evolution_task.py              (合并提炼 + Insight + 淘汰)
 """
@@ -75,17 +75,66 @@ class GloriousEvolutionPlugin(Star):
         except Exception as e:
             logger.error(f"[Glorious Evolution] EmbeddingProvider 注入失败: {e}")
 
+    # ── 分类器注入 ──
+
+    async def _init_classifier(self) -> None:
+        """注入 LLM 驱动的自动分类器"""
+        try:
+            provider = self.context.get_using_provider()
+            if not provider:
+                providers = self.context.get_all_providers()
+                if providers:
+                    provider = providers[0]
+            if not provider:
+                logger.warning("[Glorious Evolution] 无 LLM Provider，分类器不可用")
+                return
+
+            valid_categories = [
+                "general", "debugging", "deployment", "coding",
+                "configuration", "security", "insight", "consolidated_rule",
+            ]
+
+            async def classify(question: str, content: str) -> str:
+                system_prompt = (
+                    "你是记忆分类器。将输入内容分类到以下类别之一（只输出类别名，不要解释）：\n"
+                    "- debugging: 调试、错误修复、故障排查\n"
+                    "- deployment: 部署、发布、CI/CD\n"
+                    "- coding: 编码、算法、数据结构、设计模式\n"
+                    "- configuration: 配置文件、环境变量、系统设置\n"
+                    "- security: 安全、权限、认证、加密\n"
+                    "- general: 通用知识、无法明确分类\n"
+                    "- insight: 系统洞察、统计分析\n"
+                    "- consolidated_rule: 合并提炼的规则\n"
+                    "输出：只返回类别名，不要任何前缀或后缀。"
+                )
+                user_prompt = f"分类以下内容：\nQ: {question[:200]}\nA: {content[:200]}"
+                response = await provider.text_chat(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.0,
+                )
+                result = response.completion_text.strip().lower()
+                if result in valid_categories:
+                    return result
+                return "general"
+
+            await self.memory_mgr.set_classify_func(classify, valid_categories)
+            logger.info("[Glorious Evolution] 自动分类器已注入")
+        except Exception as e:
+            logger.warning(f"[Glorious Evolution] 分类器初始化失败: {e}")
+
     # ── 生命周期 ──
 
     async def start(self) -> None:
-        """插件启动后：注入 Embedding 供应商 + 加载向量索引 + 启动后台进化"""
+        """插件启动后：注入 Embedding 供应商 + 分类器 + 加载向量索引 + 启动后台进化"""
         await self._init_embedding_provider()
+        await self._init_classifier()
         await self.memory_mgr.load_vectors()
 
         # 启动后台进化循环：每 6 小时运行一次
         self._evo_task = asyncio.create_task(self._evolution_loop())
 
-        logger.info("[Glorious Evolution] v1.0.0 启动完成 (Memory + Reasoning + Evolution)")
+        logger.info("[Glorious Evolution] v1.0.0 启动完成 (Memory + Reasoning + Evolution + Classifier)")
 
     async def terminate(self) -> None:
         """插件关闭时清理资源"""
@@ -176,7 +225,7 @@ class GloriousEvolutionPlugin(Star):
         for i, entry in enumerate(results, 1):
             win_rate_bar = "█" * int(entry.win_rate * 10) + "░" * (10 - int(entry.win_rate * 10))
             lines.append(
-                f"{i}. [{entry.memory_type.value}] {entry.question[:60]}\n"
+                f"{i}. [{entry.memory_type.value}] [{entry.category}] {entry.question[:60]}\n"
                 f"   📊 胜率: {win_rate_bar} {entry.win_rate:.0%} "
                 f"(使用{entry.usage_count}次)\n"
                 f"   📝 {entry.content[:100]}"
@@ -338,12 +387,14 @@ class GloriousEvolutionPlugin(Star):
         total = stats.get("total_memories", 0)
         avg_win_rate = stats.get("avg_win_rate", 0)
         embedding_ready = stats.get("embedding_ready", False)
+        classifier_ready = stats.get("classifier_ready", False)
 
         yield event.plain_result(
             f"📊 光荣进化 v1.0.0\n"
             f"📚 记忆: {total} | 📈 胜率: {avg_win_rate:.0%} | "
-            f"🧠 向量化: {'✅' if embedding_ready else '⏳'}\n"
-            f"🧬 Full MIA: Memory + Reasoning + Evolution ✅"
+            f"🧠 向量化: {'✅' if embedding_ready else '⏳'} | "
+            f"🏷️ 分类器: {'✅' if classifier_ready else '⏳'}\n"
+            f"🧬 Full MIA: Memory + Reasoning + Evolution + Classification ✅"
         )
 
     # ── 指令：/store 手动存储记忆 ──
@@ -379,6 +430,8 @@ class GloriousEvolutionPlugin(Star):
         vector_index_size = stats.get("vector_index_size", 0)
         embedding_ready = stats.get("embedding_ready", False)
         embedding_dim = stats.get("embedding_dim", 0)
+        classifier_ready = stats.get("classifier_ready", False)
+        category_boost = stats.get("category_boost", 1.15)
 
         lines = [
             "📊 光荣进化统计报告",
@@ -388,6 +441,8 @@ class GloriousEvolutionPlugin(Star):
             f"🔢 向量索引: {vector_index_size} 条",
             f"🧠 向量化: {'✅ 已接入' if embedding_ready else '⏳ 待接入'}"
             + (f" (dim={embedding_dim})" if embedding_ready else ""),
+            f"🏷️ 分类器: {'✅ 已接入' if classifier_ready else '⏳ 待接入'}",
+            f"📦 同类桶加权: {category_boost}x",
         ]
 
         by_type = stats.get("by_type", {})
@@ -407,6 +462,12 @@ class GloriousEvolutionPlugin(Star):
             j_labels = {"correct": "✅ 有效", "incorrect": "❌ 无效", "pending": "⏳ 待定"}
             for j, c in by_judgement.items():
                 lines.append(f"  • {j_labels.get(j, j)}: {c}")
+
+        by_category = stats.get("by_category", {})
+        if by_category:
+            lines.append("\n🏷️ 按分类分布:")
+            for cat, c in by_category.items():
+                lines.append(f"  • {cat}: {c}")
 
         top = stats.get("top_win_rate", [])
         if top:

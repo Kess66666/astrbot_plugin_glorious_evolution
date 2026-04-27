@@ -176,6 +176,7 @@ class EvolutionEngine:
         4. 用 Union-Find 聚簇（相似度 > CONSOLIDATION_SIM_THRESHOLD 且 > 0）
         5. 对每个簇（>=2 条）并发调用 LLM 提炼规则（受 LLM_CONCURRENCY 控制）
         6. 存储合并后的 declarative 规则
+        7. 对未合并的 episodic 条目做分类漂移修正
         """
         np = _lazy_import_numpy()
 
@@ -265,6 +266,24 @@ class EvolutionEngine:
             elif result is True:
                 consolidated_count += 1
 
+        # ── 6. 分类漂移修正：对未被合并的 episodic 条目做分类修正 ──
+        if self.memory_mgr._classify_func is not None and consolidated_count > 0:
+            for entry in episodic:
+                if entry.category == "general":
+                    try:
+                        new_cat = await self.memory_mgr._classify_func(
+                            entry.question, entry.content,
+                        )
+                        if new_cat != "general":
+                            await self.memory_mgr.storage.update_entry(
+                                entry.id, category=new_cat,
+                            )
+                            logger.debug(
+                                f"[Evolution] 类别漂移修正: {entry.id} general → {new_cat}"
+                            )
+                    except Exception:
+                        pass
+
         return consolidated_count
 
     async def _call_llm_and_store(
@@ -274,6 +293,8 @@ class EvolutionEngine:
     ) -> bool:
         """
         受控调用 LLM 并存储合并结果。
+
+        合并后使用分类器修正 category（替代默认的 "consolidated_rule"）。
 
         Returns:
             True 表示成功生成并存储规则
@@ -295,19 +316,33 @@ class EvolutionEngine:
         source_ids = [e.id for e in cluster_entries]
         rules_json = json.dumps(source_ids, ensure_ascii=False)
 
-        # 存储合并后的规则
+        # ── 分类修正：用分类器对合并后的规则重新分类 ──
+        category = "consolidated_rule"
+        if self.memory_mgr._classify_func is not None:
+            try:
+                new_cat = await self.memory_mgr._classify_func(rule_text[:200], rule_text)
+                if new_cat in ("debugging", "deployment", "coding", "configuration",
+                               "security", "general", "insight", "consolidated_rule"):
+                    category = new_cat
+                    logger.info(
+                        f"[Evolution] 分类修正: {rule_text[:50]}... → {category}"
+                    )
+            except Exception:
+                pass
+
+        # 存储合并后的规则（使用修正后的 category）
         entry_id = await self.memory_mgr.add_memory(
             question=rule_text[:200],
             content=rule_text,
             memory_type="declarative",
-            category="consolidated_rule",
+            category=category,
             rules=rules_json,
         )
 
         logger.info(
             f"[Evolution] 合并规则 {entry_id}: "
             f"来源 {len(source_ids)} 条 episodic "
-            f"({', '.join(source_ids)})"
+            f"({', '.join(source_ids)}) category={category}"
         )
         return True
 
@@ -360,6 +395,12 @@ class EvolutionEngine:
         if by_judgement:
             stats_text_lines.append("评判分布: " + ", ".join(
                 f"{j}={c}" for j, c in by_judgement.items()
+            ))
+
+        by_category = stats.get("by_category", {})
+        if by_category:
+            stats_text_lines.append("分类分布: " + ", ".join(
+                f"{cat}={c}" for cat, c in by_category.items()
             ))
 
         # 格式化 top/bottom
