@@ -11,6 +11,7 @@ MIA Phase 3: 记忆合并提炼 + Insight 生成 + 后台进化循环
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .memory_manager import MemoryManager, _lazy_import_numpy
@@ -24,10 +25,20 @@ class EvolutionEngine:
     后台进化引擎。
 
     不依赖消息事件（event），通过 Context 获取 LLM Provider。
+    内置并发保护（asyncio.Lock）、规模上限、LLM 并发信号量。
     """
 
     # 记忆合并余弦相似度阈值
     CONSOLIDATION_SIM_THRESHOLD: float = 0.85
+
+    # 规模保护：单次合并最多处理的 episodic 候选数（防止 O(n²) 爆炸）
+    MAX_CONSOLIDATE_CANDIDATES: int = 500
+
+    # LLM 调用并发上限（防止 API 配额耗尽 / 429）
+    LLM_CONCURRENCY: int = 3
+
+    # 单周期超时（秒）
+    CYCLE_TIMEOUT: int = 300
 
     def __init__(
         self,
@@ -38,6 +49,12 @@ class EvolutionEngine:
         self.memory_mgr = memory_mgr
         self.reasoning = reasoning_engine
         self.context = context
+
+        # 并发保护：保证同一时间只有一个进化周期
+        self._evo_lock: asyncio.Lock = asyncio.Lock()
+
+        # LLM 并发信号量
+        self._llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(self.LLM_CONCURRENCY)
 
     # ── Provider 获取（后台任务专用，无 event） ──
 
@@ -56,12 +73,56 @@ class EvolutionEngine:
             raise RuntimeError("No LLM provider for background evolution tasks")
         return provider
 
-    # ── Union-Find（纯 Python dict 实现） ──
+    # ── 受控 LLM 调用 ──
+
+    async def _call_llm_consolidate(
+        self,
+        provider: Any,
+        cluster_entries: List,
+    ) -> Optional[str]:
+        """
+        带信号量保护的 LLM 合并调用。
+
+        Args:
+            provider: LLM provider 实例
+            cluster_entries: 簇内 MemoryEntry 列表
+
+        Returns:
+            提炼后的规则文本，失败返回 None
+        """
+        memory_lines = []
+        for idx, entry in enumerate(cluster_entries, 1):
+            memory_lines.append(
+                f"记忆{idx}: Q: {entry.question}\nA: {entry.content}"
+            )
+
+        user_prompt = (
+            "以下是多条相似的情景记忆，请将它们合并提炼为一条通用的陈述性规则：\n\n"
+            + "\n\n".join(memory_lines)
+            + "\n\n请输出提炼后的规则（纯文本）："
+        )
+
+        system_prompt = (
+            "你是一个知识提炼专家。将多条情景记忆合并为一条简洁的陈述性规则。"
+            "规则应包含：(1)核心模式 (2)决策准则 (3)适用场景。"
+            "输出格式为纯文本规则，不要包含标题或编号。"
+        )
+
+        async with self._llm_semaphore:
+            async with asyncio.timeout(30):
+                response = await provider.text_chat(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.0,
+                )
+            return response.completion_text.strip()
+
+    # ── Union-Find（纯 Python dict 实现，路径压缩 + 按秩合并） ──
 
     @staticmethod
     def _union_find(n: int, edges: List[Tuple[int, int]]) -> List[List[int]]:
         """
-        简易 Union-Find：返回连通分量列表。
+        简易 Union-Find（路径压缩 + 按秩合并）：返回连通分量列表。
 
         Args:
             n: 节点总数
@@ -74,12 +135,14 @@ class EvolutionEngine:
         rank: Dict[int, int] = {i: 0 for i in range(n)}
 
         def find(x: int) -> int:
+            # Path compression (iterative)
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
 
         def union(x: int, y: int) -> None:
+            # Union-by-rank
             rx, ry = find(x), find(y)
             if rx == ry:
                 return
@@ -107,22 +170,30 @@ class EvolutionEngine:
         记忆合并提炼。
 
         流程：
-        1. 获取所有 episodic 类型记忆
+        1. 获取 episodic 类型记忆（受 MAX_CONSOLIDATE_CANDIDATES 上限）
         2. 对每条的 question+content 做向量化
-        3. 计算 pairwise 余弦相似度矩阵
-        4. 用 Union-Find 聚簇（相似度 > CONSOLIDATION_SIM_THRESHOLD）
-        5. 对每个簇（>=2 条）调用 LLM 提炼规则
+        3. 计算 pairwise 余弦相似度矩阵（省去一半计算 + 规模保护）
+        4. 用 Union-Find 聚簇（相似度 > CONSOLIDATION_SIM_THRESHOLD 且 > 0）
+        5. 对每个簇（>=2 条）并发调用 LLM 提炼规则（受 LLM_CONCURRENCY 控制）
         6. 存储合并后的 declarative 规则
         """
         np = _lazy_import_numpy()
 
-        # 1. 获取所有 episodic 记忆
+        # 1. 获取 episodic 记忆（硬上限截断）
         all_entries = await self.memory_mgr.storage.get_all_entries(limit=10000)
         episodic = [e for e in all_entries if e.memory_type.value == "episodic"]
 
         if len(episodic) < 2:
             logger.debug("[Evolution] episodic 记忆不足 2 条，跳过合并")
             return 0
+
+        # 规模保护：只取最近 N 条，防止 O(n²) 爆炸
+        if len(episodic) > self.MAX_CONSOLIDATE_CANDIDATES:
+            logger.info(
+                f"[Evolution] episodic 候选 {len(episodic)} 条 → "
+                f"截断至 {self.MAX_CONSOLIDATE_CANDIDATES}"
+            )
+            episodic = episodic[:self.MAX_CONSOLIDATE_CANDIDATES]
 
         # 2. 向量化
         vectors: List[Optional[List[float]]] = []
@@ -144,11 +215,10 @@ class EvolutionEngine:
             logger.debug("[Evolution] 有效向量不足 2 条或 numpy 不可用，跳过合并")
             return 0
 
-        # 3. 计算 pairwise 余弦相似度
+        # 3. 计算 pairwise 余弦相似度（O(n²/2)，但受规模限制）
         vec_arrs = [np.array(v, dtype=np.float32) for v in vectors if v is not None]
         n = len(vec_arrs)
 
-        # 归一化
         norms = [np.linalg.norm(v) for v in vec_arrs]
         edges: List[Tuple[int, int]] = []
 
@@ -159,7 +229,8 @@ class EvolutionEngine:
                 if norms[j] == 0:
                     continue
                 sim = float(np.dot(vec_arrs[i], vec_arrs[j]) / (norms[i] * norms[j]))
-                if sim > self.CONSOLIDATION_SIM_THRESHOLD:
+                # 仅当正相似度超过阈值时才连接（排除反义向量误导）
+                if sim > 0 and sim > self.CONSOLIDATION_SIM_THRESHOLD:
                     edges.append((i, j))
 
         if not edges:
@@ -174,70 +245,71 @@ class EvolutionEngine:
             logger.debug("[Evolution] 无足够大的簇，跳过合并")
             return 0
 
-        # 5. 对每个簇调用 LLM 提炼规则
+        # 5. 对每个簇并发调用 LLM 提炼规则（受信号量限制）
         consolidated_count = 0
         provider = self._get_provider()
 
-        system_prompt = (
-            "你是一个知识提炼专家。将多条情景记忆合并为一条简洁的陈述性规则。"
-            "规则应包含：(1)核心模式 (2)决策准则 (3)适用场景。"
-            "输出格式为纯文本规则，不要包含标题或编号。"
-        )
+        logger.info(f"[Evolution] 开始合并 {len(big_clusters)} 个簇")
 
+        # 并发执行所有合并任务
+        tasks = []
         for cluster_indices in big_clusters:
-            # 构建簇内记忆文本
             cluster_entries = [valid_entries[ci] for ci in cluster_indices]
-            memory_lines = []
-            for idx, entry in enumerate(cluster_entries, 1):
-                memory_lines.append(
-                    f"记忆{idx}: Q: {entry.question}\nA: {entry.content}"
-                )
+            tasks.append(self._call_llm_and_store(provider, cluster_entries))
 
-            user_prompt = (
-                "以下是多条相似的情景记忆，请将它们合并提炼为一条通用的陈述性规则：\n\n"
-                + "\n\n".join(memory_lines)
-                + "\n\n请输出提炼后的规则（纯文本）："
-            )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            try:
-                async with asyncio.timeout(30):
-                    response = await provider.text_chat(
-                        prompt=user_prompt,
-                        system_prompt=system_prompt,
-                        temperature=0.0,
-                    )
-                    rule_text = response.completion_text.strip()
-
-                if not rule_text:
-                    logger.warning(f"[Evolution] LLM 返回空规则，跳过簇")
-                    continue
-
-                # 原始条目 ID 列表
-                source_ids = [e.id for e in cluster_entries]
-                rules_json = json.dumps(source_ids, ensure_ascii=False)
-
-                # 存储合并后的规则
-                entry_id = await self.memory_mgr.add_memory(
-                    question=rule_text[:200],
-                    content=rule_text,
-                    memory_type="declarative",
-                    category="consolidated_rule",
-                    rules=rules_json,
-                )
-
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"[Evolution] 合并任务异常: {result}", exc_info=result)
+            elif result is True:
                 consolidated_count += 1
-                logger.info(
-                    f"[Evolution] 合并规则 {entry_id}: "
-                    f"来源 {len(source_ids)} 条 episodic "
-                    f"({', '.join(source_ids)})"
-                )
-
-            except asyncio.TimeoutError:
-                logger.error("[Evolution] LLM 合并调用超时 (30s)")
-            except Exception as e:
-                logger.error(f"[Evolution] 合并簇失败: {e}", exc_info=True)
 
         return consolidated_count
+
+    async def _call_llm_and_store(
+        self,
+        provider: Any,
+        cluster_entries: List,
+    ) -> bool:
+        """
+        受控调用 LLM 并存储合并结果。
+
+        Returns:
+            True 表示成功生成并存储规则
+        """
+        try:
+            rule_text = await self._call_llm_consolidate(provider, cluster_entries)
+        except asyncio.TimeoutError:
+            logger.error("[Evolution] LLM 合并调用超时 (30s)")
+            return False
+        except Exception as e:
+            logger.error(f"[Evolution] LLM 合并调用失败: {e}", exc_info=True)
+            return False
+
+        if not rule_text:
+            logger.warning("[Evolution] LLM 返回空规则，跳过簇")
+            return False
+
+        # 原始条目 ID 列表
+        source_ids = [e.id for e in cluster_entries]
+        rules_json = json.dumps(source_ids, ensure_ascii=False)
+
+        # 存储合并后的规则
+        entry_id = await self.memory_mgr.add_memory(
+            question=rule_text[:200],
+            content=rule_text,
+            memory_type="declarative",
+            category="consolidated_rule",
+            rules=rules_json,
+        )
+
+        logger.info(
+            f"[Evolution] 合并规则 {entry_id}: "
+            f"来源 {len(source_ids)} 条 episodic "
+            f"({', '.join(source_ids)})"
+        )
+        return True
 
     # ── 胜率 Insight 生成 ──
 
@@ -333,19 +405,19 @@ class EvolutionEngine:
         insight_count = 0
 
         try:
-            async with asyncio.timeout(30):
-                response = await provider.text_chat(
-                    prompt=user_prompt,
-                    system_prompt=system_prompt,
-                    temperature=0.3,
-                )
-                text = response.completion_text.strip()
+            async with self._llm_semaphore:
+                async with asyncio.timeout(30):
+                    response = await provider.text_chat(
+                        prompt=user_prompt,
+                        system_prompt=system_prompt,
+                        temperature=0.3,
+                    )
+                    text = response.completion_text.strip()
 
             if not text:
                 return 0
 
             # 按编号拆分洞察
-            import re
             insights = re.split(r"\n\s*\d+[\.\)、]\s*", text)
             insights = [ins.strip() for ins in insights if ins.strip()]
 
@@ -374,15 +446,18 @@ class EvolutionEngine:
         """
         完整进化周期：合并 + 洞察 + 淘汰。
 
+        使用 _evo_lock 保证同一时间只有一个周期运行。
+
         Returns:
             {"consolidated": N, "insights": N, "evicted": N}
         """
-        result = {
-            "consolidated": 0,
-            "insights": 0,
-            "evicted": 0,
-        }
-        result["consolidated"] = await self.consolidate_episodic_memories()
-        result["insights"] = await self.generate_insights()
-        result["evicted"] = await self.memory_mgr.evict_low_quality()
-        return result
+        async with self._evo_lock:
+            result = {
+                "consolidated": 0,
+                "insights": 0,
+                "evicted": 0,
+            }
+            result["consolidated"] = await self.consolidate_episodic_memories()
+            result["insights"] = await self.generate_insights()
+            result["evicted"] = await self.memory_mgr.evict_low_quality()
+            return result

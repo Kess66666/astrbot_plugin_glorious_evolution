@@ -91,6 +91,11 @@ class GloriousEvolutionPlugin(Star):
         """插件关闭时清理资源"""
         if self._evo_task:
             self._evo_task.cancel()
+            try:
+                await self._evo_task  # 等待任务真正结束，防止 CancelledError 泄漏
+            except asyncio.CancelledError:
+                pass  # 预期行为
+            self._evo_task = None
 
     async def _evolution_loop(self) -> None:
         """后台进化循环，每 6 小时运行一次"""
@@ -107,11 +112,12 @@ class GloriousEvolutionPlugin(Star):
                     f"insights={result['insights']} "
                     f"evicted={result['evicted']}"
                 )
+                # 成功后按正常周期休眠 6 小时
+                await asyncio.sleep(21600)
             except Exception as e:
                 logger.error(f"[Glorious Evolution] 进化周期异常: {e}", exc_info=True)
-
-            # 每 6 小时 (21600 秒)
-            await asyncio.sleep(21600)
+                # 失败后退避重试：5 分钟后重试
+                await asyncio.sleep(300)
 
     # ── LLM Tool：存储记忆 ──
 
@@ -231,14 +237,21 @@ class GloriousEvolutionPlugin(Star):
 
     @filter.llm_tool(name="trigger_evolution", description="手动触发一次进化周期，包括记忆合并、洞察生成和淘汰。")
     async def trigger_evolution_tool(self, event: AstrMessageEvent):
-        """手动触发一次完整的进化周期。"""
-        result = await self.evolution.run_evolution_cycle()
-        yield event.plain_result(
-            f"🧬 进化周期完成\n"
-            f"📦 合并规则: {result['consolidated']} 条\n"
-            f"💡 生成洞察: {result['insights']} 条\n"
-            f"🗑️ 淘汰记忆: {result['evicted']} 条"
-        )
+        """手动触发一次完整的进化周期（2 分钟超时保护）。"""
+        try:
+            async with asyncio.timeout(120):
+                result = await self.evolution.run_evolution_cycle()
+            yield event.plain_result(
+                f"🧬 进化周期完成\n"
+                f"📦 合并规则: {result['consolidated']} 条\n"
+                f"💡 生成洞察: {result['insights']} 条\n"
+                f"🗑️ 淘汰记忆: {result['evicted']} 条"
+            )
+        except asyncio.TimeoutError:
+            yield event.plain_result("⏰ 进化超时（2 分钟），请稍后重试")
+        except Exception as e:
+            logger.error(f"[Glorious Evolution] 手动进化失败: {e}", exc_info=True)
+            yield event.plain_result(f"❌ 进化失败: {str(e)[:100]}")
 
     # ── LLM Tool：生成行动计划 ──
 
