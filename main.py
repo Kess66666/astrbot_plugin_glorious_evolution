@@ -1,5 +1,5 @@
 """
-光荣进化系统 v1.0.0 - AstrBot 插件
+光荣进化系统 v1.0.0 — AstrBot 插件
 融合 MIA 智能记忆框架与自改进机制的进化系统
 
 三层架构（v1.0.0 Full MIA）：
@@ -14,6 +14,7 @@ import os
 from astrbot.api.star import Star, Context
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger
+from astrbot.core.provider.provider import EmbeddingProvider
 
 from .storage import Storage
 from .memory_manager import MemoryManager
@@ -30,7 +31,8 @@ class GloriousEvolutionPlugin(Star):
         self.config = kwargs.get("config") or {}
 
         # ── 数据层：SQLite + MemoryManager ──
-        data_dir = os.path.dirname(__file__)
+        # 持久化到 /AstrBot/data/，避免卸载/删除插件时数据库丢失 (v1.0.0+db迁移)
+        data_dir = "/AstrBot/data"
         self.storage = Storage(data_dir)
         self.memory_mgr = MemoryManager(self.storage)
 
@@ -45,35 +47,89 @@ class GloriousEvolutionPlugin(Star):
 
         logger.info("[Glorious Evolution] v1.0.0 初始化完成 (Memory + Reasoning + Evolution)")
 
-    # ── Embedding 供应商注入 ──
+    # ── Embedding 供应商注入（v1.0.1：退避重试 + 配置化 + 类型检查）──
 
     async def _init_embedding_provider(self) -> None:
         """
-        注入 AstrBot EmbeddingProvider 作为向量化钩子。
+        带指数退避重试的 EmbeddingProvider 注入，参考 LivingMemory 模式。
 
-        通过 context.get_all_embedding_providers() 获取用户在
-        AstrBot 后台配置的 embedding 供应商，取第一个可用的。
+        策略：
+          1) 从 self.config["embedding_provider_id"] 按 ID 精确获取
+          2) 未配置时回退到 get_all_embedding_providers()[0]
+          3) isinstance 类型检查，确保是 EmbeddingProvider
+          4) 成功后立即调用 memory_mgr.load_vectors() 点火
+          5) 失败则以指数退避重试（最多 60 次 / 最大间隔 30s）
         """
-        try:
-            emb_providers = self.context.get_all_embedding_providers()
-            if emb_providers:
-                provider = emb_providers[0]
-                dim = provider.get_dim()
-                await self.memory_mgr.set_embed_func(
-                    provider.get_embedding,
-                    dim,
+        max_attempts = 60
+        base_delay = 2.0
+        max_delay = 30.0
+        attempt = 0
+        delay = base_delay
+
+        while attempt < max_attempts:
+            attempt += 1
+            provider = None
+
+            # ① 按配置 ID 精确获取
+            emb_id = self.config.get("embedding_provider_id")
+            if emb_id:
+                try:
+                    p = self.context.get_provider_by_id(emb_id)
+                    if p and isinstance(p, EmbeddingProvider):
+                        provider = p
+                    elif p:
+                        logger.warning(
+                            f"[GE] config 指定的 EmbeddingProvider "
+                            f"'{emb_id}' 不是 EmbeddingProvider 类型，已忽略"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[GE] 按 ID 获取 EmbeddingProvider 失败: {e}"
+                    )
+
+            # ② 兜底：取全局第一个 EmbeddingProvider
+            if provider is None:
+                try:
+                    candidates = self.context.get_all_embedding_providers()
+                    if candidates:
+                        provider = candidates[0]
+                except Exception as e:
+                    logger.debug(f"[GE] get_all_embedding_providers 失败: {e}")
+
+            # ③ 类型检查 + 维度打印 + 注入
+            if provider is not None and isinstance(provider, EmbeddingProvider):
+                try:
+                    dim = provider.get_dim()
+                    await self.memory_mgr.set_embed_func(
+                        provider.get_embedding,
+                        dim,
+                    )
+                    logger.info(
+                        f"[GE] EmbeddingProvider 就绪 "
+                        f"(dim={dim}, attempt={attempt}/{max_attempts})"
+                    )
+
+                    # ④ 立即点火：加载向量索引
+                    await self.memory_mgr.load_vectors()
+                    return
+                except Exception as e:
+                    logger.error(
+                        f"[GE] EmbeddingProvider 注入/加载向量失败 (attempt={attempt}): {e}"
+                    )
+
+            # ⑤ 退避重试
+            if attempt < max_attempts:
+                logger.debug(
+                    f"[GE] EmbeddingProvider 未就绪 "
+                    f"(attempt {attempt}/{max_attempts})，{delay:.1f}s 后重试..."
                 )
-                logger.info(
-                    f"[Glorious Evolution] EmbeddingProvider 钩子注入成功 "
-                    f"(dim={dim})"
-                )
-            else:
-                logger.warning(
-                    "[Glorious Evolution] 未找到 EmbeddingProvider，"
-                    "向量检索不可用，仅使用 FTS5 全文搜索"
-                )
-        except Exception as e:
-            logger.error(f"[Glorious Evolution] EmbeddingProvider 注入失败: {e}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.5, max_delay)
+
+        logger.warning(
+            f"[GE] EmbeddingProvider 在 {max_attempts} 次重试后仍未就绪，"
+            "向量检索不可用，仅使用 FTS5 全文搜索"
+        )
 
     # ── 分类器注入 ──
 
@@ -126,10 +182,9 @@ class GloriousEvolutionPlugin(Star):
     # ── 生命周期 ──
 
     async def start(self) -> None:
-        """插件启动后：注入 Embedding 供应商 + 分类器 + 加载向量索引 + 启动后台进化"""
-        await self._init_embedding_provider()
+        """插件启动后：注入 Embedding 供应商 + 分类器 + 启动后台进化"""
+        await self._init_embedding_provider()   # 含退避重试 + load_vectors()
         await self._init_classifier()
-        await self.memory_mgr.load_vectors()
 
         # 启动后台进化循环：每 6 小时运行一次
         self._evo_task = asyncio.create_task(self._evolution_loop())
