@@ -10,6 +10,8 @@
 
 import asyncio
 import os
+import json
+import sqlite3
 
 from astrbot.api.star import Star, Context
 from astrbot.api.event import filter, AstrMessageEvent
@@ -57,7 +59,7 @@ class GloriousEvolutionPlugin(Star):
           1) 从 self.config["embedding_provider_id"] 按 ID 精确获取
           2) 未配置时回退到 get_all_embedding_providers()[0]
           3) isinstance 类型检查，确保是 EmbeddingProvider
-          4) 成功后立即调用 memory_mgr.load_vectors() 点火
+          4) 成功后调用 load_vectors() + backfill_embeddings() 点火
           5) 失败则以指数退避重试（最多 60 次 / 最大间隔 30s）
         """
         max_attempts = 60
@@ -109,8 +111,9 @@ class GloriousEvolutionPlugin(Star):
                         f"(dim={dim}, attempt={attempt}/{max_attempts})"
                     )
 
-                    # ④ 立即点火：加载向量索引
+                    # ④ 立即点火：加载已有向量 + 回填缺失的向量
                     await self.memory_mgr.load_vectors()
+                    await self._backfill_embeddings()
                     return
                 except Exception as e:
                     logger.error(
@@ -130,6 +133,65 @@ class GloriousEvolutionPlugin(Star):
             f"[GE] EmbeddingProvider 在 {max_attempts} 次重试后仍未就绪，"
             "向量检索不可用，仅使用 FTS5 全文搜索"
         )
+
+    async def _backfill_embeddings(self) -> None:
+        """
+        回填所有 embedding 为 NULL 的历史记忆。
+
+        适用场景：
+          - Python 脚本直接插入的条目（跳过了 embed_text）
+          - Provider 延迟就绪时 store_memory 写入的条目
+          - 旧版本升级、数据迁移后遗留的空向量
+
+        策略：逐条从 SQLite 读取 question，调 embed_text，写入 embedding 列，
+        同时加入内存向量索引。
+        """
+        db_path = self.storage.db_path
+        if not os.path.exists(db_path):
+            return
+
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT id, question FROM memories WHERE embedding IS NULL"
+            ).fetchall()
+
+            if not rows:
+                return  # 全部已回填，无需操作
+
+            total = len(rows)
+            filled = 0
+
+            for entry_id, question in rows:
+                if not question:
+                    continue
+                try:
+                    embedding = await self.memory_mgr.embed_text(question)
+                    if embedding is None:
+                        continue
+
+                    blob = json.dumps(embedding).encode()
+                    conn.execute(
+                        "UPDATE memories SET embedding = ? WHERE id = ?",
+                        (blob, entry_id),
+                    )
+                    conn.commit()
+
+                    # 加入内存向量索引
+                    entry = await self.storage.get_entry(entry_id)
+                    win_rate = entry.win_rate if entry else 0.0
+                    self.memory_mgr._add_vector(entry_id, embedding, win_rate)
+                    filled += 1
+
+                except Exception as e:
+                    logger.debug(f"[GE] 回填向量失败 ({entry_id}): {e}")
+
+            logger.info(
+                f"[GE] 向量回填完成: {filled}/{total} 条"
+            )
+
+        finally:
+            conn.close()
 
     # ── 分类器注入 ──
 
@@ -183,7 +245,7 @@ class GloriousEvolutionPlugin(Star):
 
     async def start(self) -> None:
         """插件启动后：注入 Embedding 供应商 + 分类器 + 启动后台进化"""
-        await self._init_embedding_provider()   # 含退避重试 + load_vectors()
+        await self._init_embedding_provider()   # 含退避重试 + load_vectors() + backfill
         await self._init_classifier()
 
         # 启动后台进化循环：每 6 小时运行一次
