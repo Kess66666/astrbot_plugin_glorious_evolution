@@ -1,0 +1,23 @@
+{
+  "memories": {
+    "MEM-20260429-001": {
+      "id": "MEM-20260429-001",
+      "question": "glorious_evolution 插件阻塞 WebUI 怎么修",
+      "content": "【核心教训 2026-04-29】glorious_evolution 插件在 _init_embedding_provider() 中对 EmbeddingProvider 进行了 60 次指数退避重试（最大延迟 30s），若无可用 Embedding 模型会导致死循环，彻底阻塞 AstrBot 初始化流程，WebUI 无法访问。\n\n【修复方案】\n1. 重试上限从 60 次降至 3 次，固定 1s 间隔（不再用指数退避）。\n2. _init_embedding_provider() 外层加 try...except 兜底，失败直接 return 并打印 error 日志。\n3. initialize() 方法中所有子初始化调用都包裹 try...except，任一失败不阻塞其余。\n\n【关键依赖】\n4. 确保 cmd_config.json 中所有 id 含 'Qwen3-Embedding-8B' 的 provider 项，其 type 必须设为 'openai_embedding'，否则 get_all_embedding_providers() 找不到它。\n\n【运维铁律】\n- 任何插件初始化严禁无上限阻塞重试。\n- 修改 cmd_config.json 前先读内容 → 存临时文件 → python3 -m json.tool 校验通过才覆盖。\n- 同时清除 UTF-8 BOM 头。",
+      "memory_type": "procedural",
+      "category": "configuration",
+      "tags": [
+        "glorious_evolution",
+        "embedding",
+        "死循环",
+        "WebUI",
+        "运维"
+      ],
+      "created_at": "2026-04-29T07:01:18.854124+08:00",
+      "last_accessed_at": "2026-04-29T07:01:18.854124+08:00",
+      "access_count": 0,
+      "win_rate": 0.0
+    }
+  },
+  "counter": 1
+}
