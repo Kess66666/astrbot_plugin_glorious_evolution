@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.1 - 修复 initialize() 生命周期钩子
+v1.0.3 - 修复 EmbeddingProvider 接口对齐 + 后台重试 + 向量冷启动恢复 + 分类器重试
 """
 
 import asyncio
@@ -31,7 +31,7 @@ EVO_STATS_FILE = os.path.join(PLUGIN_DIR, "evolution_stats.json")
 CHROMA_PATH = os.path.join(PLUGIN_DIR, "chroma_db")
 
 # ── 常量 ──
-VERSION = "1.0.1"
+VERSION = "1.0.3"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -295,7 +295,6 @@ async def classify_memory(question: str, content: str, llm_call) -> dict:
     )
     try:
         resp = await llm_call(prompt)
-        # 提取 JSON
         json_start = resp.find("{")
         json_end = resp.rfind("}") + 1
         if json_start != -1 and json_end > json_start:
@@ -325,71 +324,100 @@ class GloriousEvolutionPlugin(Star):
         self.evo_stats = EvolutionStats(EVO_STATS_FILE)
 
         # 运行时状态
-        self._embedding_provider = None  # 延迟注入
+        self._embedding_provider = None
+        self._embedding_retry_task: Optional[asyncio.Task] = None
+        self._classifier_retry_task: Optional[asyncio.Task] = None
         self._evo_task: Optional[asyncio.Task] = None
-        self._classifier_llm = None  # LLM 调用函数
+        self._classifier_llm = None
 
         logger.info(f"[Glorious Evolution] v{VERSION} __init__ 完成")
 
-    # ── Embedding 供应商注入 (参考 livingmemory 用 context.get_all_embedding_providers) ──
+    # ── Embedding 供应商注入 ──
 
     async def _init_embedding_provider(self) -> None:
-        """轻量重试获取 EmbeddingProvider，最多 3 次，绝不阻塞主进程"""
+        if self.vector_store.ready:
+            return
 
-        MAX_RETRIES = 3
-        RETRY_DELAY = 1.0  # 固定 1 秒间隔，不用指数退避
+        emb_providers = self.context.get_all_embedding_providers()
+        if emb_providers and len(emb_providers) > 0:
+            self._embedding_provider = emb_providers[0]
+            pid = getattr(self._embedding_provider, 'id', 'unknown')
+            logger.info(f"[GE] EmbeddingProvider 就绪 (即时): {pid}")
+            await self._setup_embed_fn_and_collection()
+            return
 
-        try:
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    emb_providers = self.context.get_all_embedding_providers()
-                    if emb_providers and len(emb_providers) > 0:
-                        self._embedding_provider = emb_providers[0]
-                        pid = getattr(self._embedding_provider, 'id', 'unknown')
-                        logger.info(f"[GE] EmbeddingProvider 就绪 (attempt {attempt}): {pid}")
-                    else:
-                        raise RuntimeError("get_all_embedding_providers 返回空列表")
-                except Exception as e:
-                    logger.warning(f"[GE] EmbeddingProvider 未就绪 (attempt {attempt}/{MAX_RETRIES}): {e}")
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(RETRY_DELAY)
-                    continue
+        if (not hasattr(self, '_embedding_retry_task') or
+                self._embedding_retry_task is None or self._embedding_retry_task.done()):
+            logger.info("[GE] EmbeddingProvider 暂未就绪，启动后台重试...")
+            self._embedding_retry_task = asyncio.create_task(self._retry_init_embedding())
 
-                # 封装 embed 函数
-                async def embed_fn(texts):
-                    req = ProviderRequest(
-                        prompt="",
-                        image_urls=[],
-                        urls=[],
-                        func_tool=None,
-                        embedding_input=texts,
-                        session=None,
-                        context_compress=False,
-                    )
-                    resp = await self._embedding_provider.text_to_embedding(req)
-                    if resp and resp.embeddings:
-                        return resp.embeddings
-                    return []
+    async def _retry_init_embedding(self):
+        MAX_RETRIES = 60
+        base_delay = 2.0
+        max_delay = 30.0
+        log_interval = 10
 
-                self.vector_store.set_embed_fn(embed_fn)
-                self.vector_store.init_collection()
-                await self.vector_store.load_vectors_from_store(self.memory_store)
-                logger.info(f"[GE] 向量化引擎就绪 (现有 {self.vector_store.count()} 条向量)")
+        for attempt in range(1, MAX_RETRIES + 1):
+            delay = min(base_delay * (1.5 ** (attempt - 1)), max_delay)
+            await asyncio.sleep(delay)
+
+            emb_providers = self.context.get_all_embedding_providers()
+            if emb_providers and len(emb_providers) > 0:
+                self._embedding_provider = emb_providers[0]
+                pid = getattr(self._embedding_provider, 'id', 'unknown')
+                logger.info(f"[GE] EmbeddingProvider 就绪 (attempt {attempt}): {pid}")
+                await self._setup_embed_fn_and_collection()
                 return
 
-            logger.warning(f"[GE] {MAX_RETRIES}次重试后仍未找到 EmbeddingProvider，向量功能不可用")
-        except Exception as e:
-            logger.error(f"[GE] EmbeddingProvider 初始化异常 (已跳过，不阻塞主进程): {e}")
+            if attempt % log_interval == 0:
+                next_delay = min(delay * 1.5, max_delay)
+                logger.info(
+                    f"[GE] 等待 EmbeddingProvider... (attempt {attempt}/{MAX_RETRIES}, "
+                    f"next delay {next_delay:.1f}s)"
+                )
+
+        logger.error(f"[GE] {MAX_RETRIES} 次重试后仍未找到 EmbeddingProvider")
+
+    async def _setup_embed_fn_and_collection(self):
+        ep = self._embedding_provider
+
+        async def embed_fn(texts):
+            return await ep.get_embeddings(texts)
+
+        self.vector_store.set_embed_fn(embed_fn)
+        self.vector_store.init_collection()
+        dim = ep.get_dim() if hasattr(ep, 'get_dim') else '?'
+        logger.info(f"[GE] ChromaDB 集合就绪 (维度={dim})")
+
+        await self.vector_store.load_vectors_from_store(self.memory_store)
+        logger.info(f"[GE] 向量回填完成 (现有 {self.vector_store.count()} 条向量)")
 
     # ── 分类器初始化 ──
 
     async def _init_classifier(self):
-        """初始化分类器：获取 LLM 调用函数"""
+        if self._classifier_llm is not None:
+            return
+
+        if self._try_setup_classifier():
+            return
+
+        if (not hasattr(self, '_classifier_retry_task') or
+                self._classifier_retry_task is None or self._classifier_retry_task.done()):
+            logger.info("[GE] 分类器 LLM 暂未就绪，启动后台重试...")
+            self._classifier_retry_task = asyncio.create_task(self._retry_init_classifier())
+
+    def _try_setup_classifier(self) -> bool:
         try:
             all_providers = self.context.get_all_providers()
+            if not all_providers:
+                logger.debug("[GE] get_all_providers 返回空列表")
+                return False
+
             for p in all_providers:
                 if hasattr(p, "text_chat"):
-                    async def llm_call(prompt):
+                    pid = getattr(p, 'id', str(p))
+
+                    async def llm_call(prompt, _p=p):
                         req = ProviderRequest(
                             prompt=prompt,
                             image_urls=[],
@@ -398,57 +426,68 @@ class GloriousEvolutionPlugin(Star):
                             session=None,
                             context_compress=False,
                         )
-                        resp = await p.text_chat(req)
+                        resp = await _p.text_chat(req)
                         return resp.completion_text if resp else ""
-                    self._classifier_llm = llm_call
-                    pid = getattr(p, 'id', str(p))
-                    logger.info(f"[GE] 分类器 LLM 就绪: {pid}")
-                    return
-            logger.warning("[GE] 未找到可用 chat provider，分类器功能不可用")
-        except Exception as e:
-            logger.warning(f"[Glorious Evolution] 分类器初始化失败: {e}")
 
-    # ── 生命周期 (AstrBot 标准钩子) ──
+                    self._classifier_llm = llm_call
+                    logger.info(f"[GE] 分类器 LLM 就绪: {pid}")
+                    return True
+
+            logger.warning("[GE] get_all_providers 返回了列表但无 text_chat 方法")
+        except Exception as e:
+            logger.warning(f"[GE] 分类器探测异常: {e}")
+        return False
+
+    async def _retry_init_classifier(self):
+        MAX_RETRIES = 60
+        base_delay = 2.0
+        max_delay = 30.0
+        log_interval = 10
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            delay = min(base_delay * (1.5 ** (attempt - 1)), max_delay)
+            await asyncio.sleep(delay)
+
+            if self._try_setup_classifier():
+                return
+
+            if attempt % log_interval == 0:
+                next_delay = min(delay * 1.5, max_delay)
+                logger.info(
+                    f"[GE] 等待分类器 LLM... (attempt {attempt}/{MAX_RETRIES}, "
+                    f"next delay {next_delay:.1f}s)"
+                )
+
+        logger.error(f"[GE] {MAX_RETRIES} 次重试后仍未找到分类器 LLM")
+
+    # ── 生命周期 ──
 
     async def initialize(self) -> None:
-        """AstrBot 标准生命周期钩子：插件加载完成后调用。初始化失败不阻塞主流程"""
         try:
             await self._init_embedding_provider()
         except Exception as e:
-            logger.error(f"[GE] 向量化初始化失败（已跳过）: {e}")
+            logger.error(f"[GE] 向量化初始化失败: {e}")
 
         try:
             await self._init_classifier()
         except Exception as e:
-            logger.error(f"[GE] 分类器初始化失败（已跳过）: {e}")
+            logger.error(f"[GE] 分类器初始化失败: {e}")
 
-        # 立即执行一次索引扫描（initialize 完成即触发）
         try:
             await self._scan_and_index()
         except Exception as e:
-            logger.error(f"[GE] 初始 scan_and_index 失败（已跳过）: {e}")
+            logger.error(f"[GE] 初始 scan_and_index 失败: {e}")
 
-        # 延迟重试：15 秒后再补一次（EmbeddingProvider 可能在首次调用时未就绪）
         asyncio.create_task(self._delayed_scan_and_index())
 
         self._evo_task = asyncio.create_task(self._evolution_loop())
-        logger.info("[Glorious Evolution] v1.0.1 启动完成 ✅")
+        logger.info("[Glorious Evolution] v1.0.3 启动完成 ✅")
 
     async def _delayed_scan_and_index(self):
-        """延迟重试 scan_and_index（等待 15 秒，处理 EmbeddingProvider 竞态）"""
-        await asyncio.sleep(15)
-        if self.vector_store.ready:
-            logger.debug("[GE] 延迟 scan_and_index 跳过: VectorStore 已就绪（首次已成功）")
-            return
-        try:
-            # 再次尝试获取 EmbeddingProvider
-            await self._init_embedding_provider()
-            await self._scan_and_index()
-        except Exception as e:
-            logger.error(f"[GE] 延迟 scan_and_index 失败（已跳过）: {e}")
+        await asyncio.sleep(30)
+        await self._scan_and_index()
 
     async def terminate(self) -> None:
-        """AstrBot 标准生命周期钩子：插件卸载时调用"""
         if self._evo_task:
             self._evo_task.cancel()
             try:
@@ -458,8 +497,7 @@ class GloriousEvolutionPlugin(Star):
             self._evo_task = None
 
     async def _evolution_loop(self) -> None:
-        """后台进化循环 — 固定 360 分钟触发 scan_and_index + 合并淘汰"""
-        INTERVAL_SECONDS = 360 * 60  # 固定 6 小时
+        INTERVAL_SECONDS = 360 * 60
 
         while True:
             try:
@@ -472,17 +510,16 @@ class GloriousEvolutionPlugin(Star):
             await asyncio.sleep(INTERVAL_SECONDS)
 
     async def _scan_and_index(self):
-        """扫描 MemoryStore 所有条目，确保 ChromaDB 向量索引完整（幂等操作）"""
         if not self.vector_store.ready:
-            logger.debug("[GE] scan_and_index 跳过: VectorStore 未就绪")
+            await self._init_embedding_provider()
+        if not self.vector_store.ready:
+            logger.warning("[GE] scan_and_index 跳过: VectorStore 仍未就绪")
             return
 
         mems = self.memory_store.list_all()
         if not mems:
-            logger.debug("[GE] scan_and_index: 记忆库为空，跳过")
             return
 
-        # 获取 ChromaDB 中已有向量 ID 集合
         existing_ids: set = set()
         try:
             existing = self.vector_store._collection.get()
@@ -493,7 +530,6 @@ class GloriousEvolutionPlugin(Star):
 
         missing = [m for m in mems if m["id"] not in existing_ids]
         if not missing:
-            logger.debug(f"[GE] scan_and_index: 全部 {len(mems)} 条已索引，无需回填")
             return
 
         indexed = 0
@@ -502,17 +538,12 @@ class GloriousEvolutionPlugin(Star):
             await self.vector_store.add(m["id"], text)
             indexed += 1
 
-        logger.info(
-            f"[GE] scan_and_index 完成: {indexed}/{len(mems)} 条新索引 "
-            f"(总计 {self.vector_store.count()} 条向量)"
-        )
+        logger.info(f"[GE] scan_and_index: {indexed}/{len(mems)} 条新索引 (总计 {self.vector_store.count()} 条)")
 
     async def _run_evolution(self):
-        """执行一次进化周期：合并洞察 + 淘汰"""
         start_ts = time.time()
         logger.info("[GE] 🧬 进化周期开始...")
 
-        # ── 洞察合并 ──
         insights = 0
         try:
             memories = self.memory_store.list_all()
@@ -537,7 +568,6 @@ class GloriousEvolutionPlugin(Star):
         except Exception as e:
             logger.warning(f"[GE] 洞察合并失败: {e}")
 
-        # ── 低胜率淘汰 ──
         evictions = 0
         try:
             for m in self.memory_store.list_all():
@@ -548,7 +578,6 @@ class GloriousEvolutionPlugin(Star):
         except Exception as e:
             logger.warning(f"[GE] 淘汰失败: {e}")
 
-        # ── 统计更新 ──
         duration = time.time() - start_ts
         self.evo_stats.increment("total_evolutions")
         self.evo_stats.increment("total_insights", insights)
@@ -558,15 +587,8 @@ class GloriousEvolutionPlugin(Star):
 
         logger.info(f"[GE] 🧬 进化完成: insights={insights} evictions={evictions} duration={duration:.1f}s")
 
-    # ── 命令 ──
-
-    async def _send(self, text: str):
-        if hasattr(self, 'context') and self.context:
-            await self.context.send_message(text)
-
     @filter.command("ges")
     async def cmd_stats(self, event: AstrMessageEvent):
-        """📊 查看进化统计"""
         mems = self.memory_store.count()
         wins = sum(1 for m in self.memory_store.list_all() if m.get("win_rate", 0) >= 0.5)
         win_rate = round(wins / mems * 100) if mems else 0
@@ -584,7 +606,6 @@ class GloriousEvolutionPlugin(Star):
 # ── 工具函数 ──
 
 async def store_memory(question: str, content: str, memory_type: str = "declarative", category: str = "general") -> str:
-    """存储一条智能记忆。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -612,7 +633,6 @@ async def store_memory(question: str, content: str, memory_type: str = "declarat
 
 
 async def search_memory(query: str, top_k: int = 5) -> str:
-    """搜索相关记忆，检索过往经验、规则或知识。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -660,7 +680,6 @@ async def search_memory(query: str, top_k: int = 5) -> str:
 
 
 async def update_win_rate(entry_id: str, success: bool) -> str:
-    """更新某条记忆的胜率，标记其是否有效。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -673,12 +692,11 @@ async def update_win_rate(entry_id: str, success: bool) -> str:
     new_rate = round((old_rate * 0.7 + (1.0 if success else 0.0) * 0.3), 3)
     plugin.memory_store.update(entry_id, {"win_rate": new_rate})
 
-    logger.info(f"[GE] win_rate 更新: {entry_id} {old_rate:.2f} → {new_rate:.2f} ({'✅' if success else '❌'})")
+    logger.info(f"[GE] win_rate 更新: {entry_id} {old_rate:.2f} → {new_rate:.2f}")
     return f"📈 {entry_id} win_rate: {old_rate:.2f} → {new_rate:.2f}"
 
 
 async def evict_memories() -> str:
-    """淘汰低胜率、低使用的记忆，保持记忆库健康。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -698,7 +716,6 @@ async def evict_memories() -> str:
 
 
 async def get_evolution_stats() -> str:
-    """获取光荣进化系统的统计概览。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -716,7 +733,6 @@ async def get_evolution_stats() -> str:
 
 
 async def trigger_evolution() -> str:
-    """手动触发一次完整的进化周期。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -729,7 +745,6 @@ async def trigger_evolution() -> str:
 
 
 async def build_plan(question: str, extra_context: str = "") -> str:
-    """基于记忆库生成行动计划。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -767,18 +782,16 @@ async def build_plan(question: str, extra_context: str = "") -> str:
 
 
 async def judge_replan(execution_trace: str) -> str:
-    """评估执行轨迹，判断是否需要重新规划。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
 
     failure_keywords = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]
     has_failure = any(kw in execution_trace.lower() for kw in failure_keywords)
-    return "🔄 建议重新规划（检测到失败标志）" if has_failure else "✅ 无需重新规划"
+    return "🔄 建议重新规划" if has_failure else "✅ 无需重新规划"
 
 
 async def build_replan(question: str, execution_trace: str) -> str:
-    """基于失败经验生成补充计划。"""
     plugin = _get_plugin()
     if not plugin:
         return "❌ 插件未就绪"
@@ -802,7 +815,6 @@ async def build_replan(question: str, execution_trace: str) -> str:
 
 
 def _get_plugin() -> Optional[GloriousEvolutionPlugin]:
-    """获取插件实例"""
     try:
         from astrbot.api.star import GlobalStarMap
         star_map = GlobalStarMap()
