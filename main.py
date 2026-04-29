@@ -422,6 +422,12 @@ class GloriousEvolutionPlugin(Star):
         except Exception as e:
             logger.error(f"[GE] 分类器初始化失败（已跳过）: {e}")
 
+        # 立即执行一次索引扫描（initialize 完成即触发）
+        try:
+            await self._scan_and_index()
+        except Exception as e:
+            logger.error(f"[GE] 初始 scan_and_index 失败（已跳过）: {e}")
+
         self._evo_task = asyncio.create_task(self._evolution_loop())
         logger.info("[Glorious Evolution] v1.0.1 启动完成 ✅")
 
@@ -436,18 +442,54 @@ class GloriousEvolutionPlugin(Star):
             self._evo_task = None
 
     async def _evolution_loop(self) -> None:
-        """后台进化循环"""
-        interval_hours = self.config.get("evolution_interval_hours", DEFAULT_EVO_INTERVAL_HOURS)
-        await asyncio.sleep(300)  # 等 5 分钟让系统预热
+        """后台进化循环 — 固定 360 分钟触发 scan_and_index + 合并淘汰"""
+        INTERVAL_SECONDS = 360 * 60  # 固定 6 小时
 
         while True:
             try:
+                await self._scan_and_index()
                 await self._run_evolution()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[GE] 进化循环异常: {e}")
-            await asyncio.sleep(interval_hours * 3600)
+            await asyncio.sleep(INTERVAL_SECONDS)
+
+    async def _scan_and_index(self):
+        """扫描 MemoryStore 所有条目，确保 ChromaDB 向量索引完整（幂等操作）"""
+        if not self.vector_store.ready:
+            logger.debug("[GE] scan_and_index 跳过: VectorStore 未就绪")
+            return
+
+        mems = self.memory_store.list_all()
+        if not mems:
+            logger.debug("[GE] scan_and_index: 记忆库为空，跳过")
+            return
+
+        # 获取 ChromaDB 中已有向量 ID 集合
+        existing_ids: set = set()
+        try:
+            existing = self.vector_store._collection.get()
+            if existing and existing.get("ids"):
+                existing_ids = set(existing["ids"])
+        except Exception:
+            pass
+
+        missing = [m for m in mems if m["id"] not in existing_ids]
+        if not missing:
+            logger.debug(f"[GE] scan_and_index: 全部 {len(mems)} 条已索引，无需回填")
+            return
+
+        indexed = 0
+        for m in missing:
+            text = _mem_to_text(m)
+            await self.vector_store.add(m["id"], text)
+            indexed += 1
+
+        logger.info(
+            f"[GE] scan_and_index 完成: {indexed}/{len(mems)} 条新索引 "
+            f"(总计 {self.vector_store.count()} 条向量)"
+        )
 
     async def _run_evolution(self):
         """执行一次进化周期：合并洞察 + 淘汰"""
