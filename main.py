@@ -428,8 +428,24 @@ class GloriousEvolutionPlugin(Star):
         except Exception as e:
             logger.error(f"[GE] 初始 scan_and_index 失败（已跳过）: {e}")
 
+        # 延迟重试：15 秒后再补一次（EmbeddingProvider 可能在首次调用时未就绪）
+        asyncio.create_task(self._delayed_scan_and_index())
+
         self._evo_task = asyncio.create_task(self._evolution_loop())
         logger.info("[Glorious Evolution] v1.0.1 启动完成 ✅")
+
+    async def _delayed_scan_and_index(self):
+        """延迟重试 scan_and_index（等待 15 秒，处理 EmbeddingProvider 竞态）"""
+        await asyncio.sleep(15)
+        if self.vector_store.ready:
+            logger.debug("[GE] 延迟 scan_and_index 跳过: VectorStore 已就绪（首次已成功）")
+            return
+        try:
+            # 再次尝试获取 EmbeddingProvider
+            await self._init_embedding_provider()
+            await self._scan_and_index()
+        except Exception as e:
+            logger.error(f"[GE] 延迟 scan_and_index 失败（已跳过）: {e}")
 
     async def terminate(self) -> None:
         """AstrBot 标准生命周期钩子：插件卸载时调用"""
