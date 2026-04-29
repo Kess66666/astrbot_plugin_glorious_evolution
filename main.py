@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.3 - 修复 EmbeddingProvider 接口对齐 + 后台重试 + 向量冷启动恢复 + 分类器重试
+v1.0.4 - 进化算法优化: 首轮延迟启动 + consolidated_rule 去重
 """
 
 import asyncio
@@ -21,6 +21,12 @@ from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 
+# ── MIA 引擎（完整版进化循环） ──
+from .storage import Storage
+from .memory_manager import MemoryManager
+from .reasoning_engine import ReasoningEngine
+from .evolution_task import EvolutionEngine
+
 # 上海时区
 CST = timezone(timedelta(hours=8))
 
@@ -31,7 +37,7 @@ EVO_STATS_FILE = os.path.join(PLUGIN_DIR, "evolution_stats.json")
 CHROMA_PATH = os.path.join(PLUGIN_DIR, "chroma_db")
 
 # ── 常量 ──
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -323,12 +329,18 @@ class GloriousEvolutionPlugin(Star):
         self.vector_store = VectorStore(CHROMA_PATH)
         self.evo_stats = EvolutionStats(EVO_STATS_FILE)
 
-        # 运行时状态
+        # ── 运行时状态 ──
         self._embedding_provider = None
         self._embedding_retry_task: Optional[asyncio.Task] = None
         self._classifier_retry_task: Optional[asyncio.Task] = None
         self._evo_task: Optional[asyncio.Task] = None
         self._classifier_llm = None
+
+        # ── MIA 完整版进化引擎（EvolutionEngine） ──
+        self._storage = Storage(PLUGIN_DIR)
+        self._memory_mgr = MemoryManager(self._storage)
+        self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
+        self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
 
         logger.info(f"[Glorious Evolution] v{VERSION} __init__ 完成")
 
@@ -392,6 +404,17 @@ class GloriousEvolutionPlugin(Star):
         await self.vector_store.load_vectors_from_store(self.memory_store)
         logger.info(f"[GE] 向量回填完成 (现有 {self.vector_store.count()} 条向量)")
 
+        # ── 注入到 MemoryManager（供 EvolutionEngine 使用） ──
+        dim = ep.get_dim() if hasattr(ep, 'get_dim') else 0
+        if dim > 0:
+            async def _mem_mgr_embed(text):
+                result = await ep.get_embeddings([text])
+                return result[0] if result else None
+            await self._memory_mgr.set_embed_func(_mem_mgr_embed, dim)
+            # 加载已有向量索引
+            await self._memory_mgr.load_vectors()
+            logger.info("[GE] MemoryManager 向量化钩子已注入 ✅")
+
     # ── 分类器初始化 ──
 
     async def _init_classifier(self):
@@ -431,6 +454,14 @@ class GloriousEvolutionPlugin(Star):
 
                     self._classifier_llm = llm_call
                     logger.info(f"[GE] 分类器 LLM 就绪: {pid}")
+
+                    # ── 注入分类器到 MemoryManager（供 EvolutionEngine 自动分类） ──
+                    async def _classify_mem(q, c):
+                        classification = await classify_memory(q, c, llm_call)
+                        return classification.get("category", "general")
+                    import asyncio as _aiolib
+                    _aiolib.ensure_future(self._memory_mgr.set_classify_func(_classify_mem))
+                    logger.info("[GE] MemoryManager 分类器钩子已注入 ✅")
                     return True
 
             logger.warning("[GE] get_all_providers 返回了列表但无 text_chat 方法")
@@ -481,7 +512,7 @@ class GloriousEvolutionPlugin(Star):
         asyncio.create_task(self._delayed_scan_and_index())
 
         self._evo_task = asyncio.create_task(self._evolution_loop())
-        logger.info("[Glorious Evolution] v1.0.3 启动完成 ✅")
+        logger.info("[Glorious Evolution] v1.0.4 启动完成 ✅")
 
     async def _delayed_scan_and_index(self):
         await asyncio.sleep(30)
@@ -498,6 +529,10 @@ class GloriousEvolutionPlugin(Star):
 
     async def _evolution_loop(self) -> None:
         INTERVAL_SECONDS = 360 * 60
+
+        # 首轮先等待一个完整间隔，避免热重载/启动即触发复盘
+        logger.info(f"[GE] 进化循环就绪，首轮将于 {INTERVAL_SECONDS//60} 分钟后执行")
+        await asyncio.sleep(INTERVAL_SECONDS)
 
         while True:
             try:
@@ -542,50 +577,37 @@ class GloriousEvolutionPlugin(Star):
 
     async def _run_evolution(self):
         start_ts = time.time()
-        logger.info("[GE] 🧬 进化周期开始...")
+        logger.info("[GE] 🧬 进化周期开始 (EvolutionEngine 完整版)...")
 
-        insights = 0
         try:
-            memories = self.memory_store.list_all()
-            if len(memories) >= 3:
-                by_category = {}
-                for m in memories:
-                    cat = m.get("category", "general")
-                    by_category.setdefault(cat, []).append(m)
-                for cat, mems in by_category.items():
-                    if len(mems) >= 3 and cat != "consolidated_rule":
-                        combined = "\n".join([
-                            f"- [{m.get('memory_type', '?')}] {m.get('question', '')} → {m.get('content', '')[:200]}"
-                            for m in mems[-5:]
-                        ])
-                        self.memory_store.add({
-                            "question": f"{cat} 类经验总结",
-                            "content": f"以下经验已合并:\n{combined}",
-                            "memory_type": "declarative",
-                            "category": "consolidated_rule",
-                        })
-                        insights += 1
+            result = await asyncio.wait_for(
+                self._evo_engine.run_evolution_cycle(),
+                timeout=self._evo_engine.CYCLE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[GE] ⚠️ EvolutionEngine 超时 (300s)，跳过本轮")
+            return
         except Exception as e:
-            logger.warning(f"[GE] 洞察合并失败: {e}")
-
-        evictions = 0
-        try:
-            for m in self.memory_store.list_all():
-                if m.get("win_rate", 1.0) < 0.1 and m.get("access_count", 0) >= 3:
-                    await self.vector_store.delete(m["id"])
-                    self.memory_store.delete(m["id"])
-                    evictions += 1
-        except Exception as e:
-            logger.warning(f"[GE] 淘汰失败: {e}")
+            logger.error(f"[GE] EvolutionEngine 异常: {e}", exc_info=True)
+            return
 
         duration = time.time() - start_ts
+
+        # 更新统计
         self.evo_stats.increment("total_evolutions")
-        self.evo_stats.increment("total_insights", insights)
-        self.evo_stats.increment("total_evictions", evictions)
+        self.evo_stats.increment("total_insights", result.get("insights", 0))
+        self.evo_stats.increment("total_consolidations", result.get("consolidated", 0))
+        self.evo_stats.increment("total_evictions", result.get("evicted", 0))
         self.evo_stats.set("last_evolution_at", datetime.now(CST).isoformat())
         self.evo_stats.set("last_evolution_duration_sec", round(duration, 2))
 
-        logger.info(f"[GE] 🧬 进化完成: insights={insights} evictions={evictions} duration={duration:.1f}s")
+        logger.info(
+            f"[GE] 🧬 进化完成: "
+            f"consolidated={result.get('consolidated', 0)} "
+            f"insights={result.get('insights', 0)} "
+            f"evicted={result.get('evicted', 0)} "
+            f"duration={duration:.1f}s"
+        )
 
     @filter.command("ges")
     async def cmd_stats(self, event: AstrMessageEvent):
