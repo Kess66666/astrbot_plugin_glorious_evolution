@@ -568,7 +568,7 @@ class MemoryManager:
 
         两阶段排序：
         1. 快速粗排：从 _vectors 计算 base_score，多取 top_k*3 候选
-        2. 精排：获取 MemoryEntry 后应用同类桶加权，重排序取 top_k
+        2. 精排：批量获取 MemoryEntry 后应用同类桶加权，重排序取 top_k
         """
         np = _lazy_import_numpy()
         if np is None or not self._vectors:
@@ -593,16 +593,14 @@ class MemoryManager:
         # 按 base_score 降序排列
         scores.sort(key=lambda x: x[1], reverse=True)
 
-        # ── 第二阶段：精排（获取完整 MemoryEntry，应用同类桶加权） ──
-        results: List[MemoryEntry] = []
-        seen_ids: set = set()
+        # ── 第二阶段：精排（批量获取 MemoryEntry，应用同类桶加权） ──
+        candidate_ids = [eid for eid, _ in scores[:top_k * 3]]
+        entry_map = await self.storage.get_entries_by_ids(candidate_ids)
+
         scored_entries: List[Tuple[float, MemoryEntry]] = []
 
         for entry_id, base_score in scores[:top_k * 3]:
-            if entry_id in seen_ids:
-                continue
-            seen_ids.add(entry_id)
-            entry = await self.storage.get_entry(entry_id)
+            entry = entry_map.get(entry_id)
             if entry is None:
                 continue
             if min_win_rate > 0 and entry.win_rate < min_win_rate:
@@ -620,6 +618,7 @@ class MemoryManager:
         # 按最终评分重排序
         scored_entries.sort(key=lambda x: x[0], reverse=True)
 
+        results: List[MemoryEntry] = []
         for _, entry in scored_entries[:top_k]:
             results.append(entry)
 

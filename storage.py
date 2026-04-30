@@ -132,6 +132,27 @@ class Storage:
             finally:
                 conn.close()
 
+    async def get_entries_by_ids(self, entry_ids: List[str]) -> Dict[str, MemoryEntry]:
+        """v1.0.5: 批量获取记忆，消除 _vector_search 的 N+1 查询"""
+        if not entry_ids:
+            return {}
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                placeholders = ",".join("?" for _ in entry_ids)
+                cursor = conn.execute(
+                    f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                    entry_ids,
+                )
+                result: Dict[str, MemoryEntry] = {}
+                for row in cursor.fetchall():
+                    d = dict(row)
+                    result[d["id"]] = MemoryEntry.from_db_row(d)
+                return result
+            finally:
+                conn.close()
+
     async def update_entry(self, entry_id: str, **kwargs: Any) -> bool:
         """更新记忆的指定字段"""
         if not kwargs:
@@ -266,6 +287,13 @@ class Storage:
                 ):
                     by_judgement[row["judgement"]] = row["cnt"]
 
+                # v1.0.5: 按类别统计
+                by_category = {}
+                for row in conn.execute(
+                    "SELECT category, COUNT(*) as cnt FROM memories GROUP BY category"
+                ):
+                    by_category[row["category"]] = row["cnt"]
+
                 # 胜率 Top 5
                 top_wr = []
                 for row in conn.execute(
@@ -282,6 +310,7 @@ class Storage:
                     "avg_win_rate": avg_wr,
                     "by_type": by_type,
                     "by_judgement": by_judgement,
+                    "by_category": by_category,
                     "top_win_rate": top_wr,
                 }
             finally:
