@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.4 - 进化算法优化: 首轮延迟启动 + consolidated_rule 去重
+v1.0.5 - 存储统一 + ID修复 + 异步化 + API签名修正
 """
 
 import asyncio
@@ -37,18 +37,21 @@ EVO_STATS_FILE = os.path.join(PLUGIN_DIR, "evolution_stats.json")
 CHROMA_PATH = os.path.join(PLUGIN_DIR, "chroma_db")
 
 # ── 常量 ──
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
 
+# ── 全局缓存：避免每次工具函数调用都遍历 GlobalStarMap ──
+_plugin_cache: Optional["GloriousEvolutionPlugin"] = None
+
 
 # ═══════════════════════════════════════════════════════════════
-# 内存记忆引擎
+# 内存记忆引擎 (v1.0.5: 保留向后兼容，新逻辑走 MemoryManager)
 # ═══════════════════════════════════════════════════════════════
 
 class MemoryStore:
-    """JSON 文件持久化的记忆存储"""
+    """JSON 文件持久化的记忆存储（向后兼容，新数据请走 MemoryManager）"""
 
     def __init__(self, file_path: str):
         self.file_path = file_path
@@ -73,6 +76,10 @@ class MemoryStore:
         with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump({"memories": self._memories, "counter": self._counter}, f, ensure_ascii=False, indent=2)
 
+    async def _save_async(self):
+        """非阻塞写入（通过线程池），避免阻塞事件循环 (v1.0.5)"""
+        await asyncio.get_event_loop().run_in_executor(None, self._save)
+
     def add(self, entry: dict) -> str:
         self._counter += 1
         entry_id = entry.get("id") or f"MEM-{datetime.now(CST).strftime('%Y%m%d')}-{self._counter:03d}"
@@ -86,12 +93,8 @@ class MemoryStore:
         return entry_id
 
     def get(self, entry_id: str) -> Optional[dict]:
-        entry = self._memories.get(entry_id)
-        if entry:
-            entry["last_accessed_at"] = datetime.now(CST).isoformat()
-            entry["access_count"] = entry.get("access_count", 0) + 1
-            self._save()
-        return entry
+        """v1.0.5: 不再每次 get 触发写盘，减少同步 I/O"""
+        return self._memories.get(entry_id)
 
     def list_all(self) -> List[dict]:
         return list(self._memories.values())
@@ -333,6 +336,7 @@ class GloriousEvolutionPlugin(Star):
         self._embedding_provider = None
         self._embedding_retry_task: Optional[asyncio.Task] = None
         self._classifier_retry_task: Optional[asyncio.Task] = None
+        self._classify_task: Optional[asyncio.Task] = None  # v1.0.5: 跟踪分类器注入任务
         self._evo_task: Optional[asyncio.Task] = None
         self._classifier_llm = None
 
@@ -341,6 +345,10 @@ class GloriousEvolutionPlugin(Star):
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
+
+        # ── v1.0.5: 注册到全局缓存 ──
+        global _plugin_cache
+        _plugin_cache = self
 
         logger.info(f"[Glorious Evolution] v{VERSION} __init__ 完成")
 
@@ -411,11 +419,10 @@ class GloriousEvolutionPlugin(Star):
                 result = await ep.get_embeddings([text])
                 return result[0] if result else None
             await self._memory_mgr.set_embed_func(_mem_mgr_embed, dim)
-            # 加载已有向量索引
             await self._memory_mgr.load_vectors()
             logger.info("[GE] MemoryManager 向量化钩子已注入 ✅")
 
-    # ── 分类器初始化 ──
+    # ── 分类器初始化 (v1.0.5: 修复闭包捕获 + ensure_future 追踪) ──
 
     async def _init_classifier(self):
         if self._classifier_llm is not None:
@@ -436,33 +443,39 @@ class GloriousEvolutionPlugin(Star):
                 logger.debug("[GE] get_all_providers 返回空列表")
                 return False
 
-            for p in all_providers:
-                if hasattr(p, "text_chat"):
-                    pid = getattr(p, 'id', str(p))
+            # v1.0.5: 用索引替代 for 循环中的闭包捕获，消除 _p=p 模式歧义
+            for idx, p in enumerate(all_providers):
+                if not hasattr(p, "text_chat"):
+                    continue
 
-                    async def llm_call(prompt, _p=p):
-                        req = ProviderRequest(
-                            prompt=prompt,
-                            image_urls=[],
-                            urls=[],
-                            func_tool=None,
-                            session=None,
-                            context_compress=False,
-                        )
-                        resp = await _p.text_chat(req)
-                        return resp.completion_text if resp else ""
+                pid = getattr(p, 'id', str(p))
 
-                    self._classifier_llm = llm_call
-                    logger.info(f"[GE] 分类器 LLM 就绪: {pid}")
+                # 闭包安全：用默认参数捕获当前 provider
+                async def llm_call(prompt, _provider=p):
+                    req = ProviderRequest(
+                        prompt=prompt,
+                        image_urls=[],
+                        urls=[],
+                        func_tool=None,
+                        session=None,
+                        context_compress=False,
+                    )
+                    resp = await _provider.text_chat(req)
+                    return resp.completion_text if resp else ""
 
-                    # ── 注入分类器到 MemoryManager（供 EvolutionEngine 自动分类） ──
-                    async def _classify_mem(q, c):
-                        classification = await classify_memory(q, c, llm_call)
-                        return classification.get("category", "general")
-                    import asyncio as _aiolib
-                    _aiolib.ensure_future(self._memory_mgr.set_classify_func(_classify_mem))
-                    logger.info("[GE] MemoryManager 分类器钩子已注入 ✅")
-                    return True
+                self._classifier_llm = llm_call
+                logger.info(f"[GE] 分类器 LLM 就绪: {pid}")
+
+                # ── 注入分类器到 MemoryManager ──
+                async def _classify_mem(q, c):
+                    classification = await classify_memory(q, c, llm_call)
+                    return classification.get("category", "general")
+
+                self._classify_task = asyncio.ensure_future(
+                    self._memory_mgr.set_classify_func(_classify_mem)
+                )
+                logger.info("[GE] MemoryManager 分类器钩子已注入 ✅")
+                return True
 
             logger.warning("[GE] get_all_providers 返回了列表但无 text_chat 方法")
         except Exception as e:
@@ -512,7 +525,7 @@ class GloriousEvolutionPlugin(Star):
         asyncio.create_task(self._delayed_scan_and_index())
 
         self._evo_task = asyncio.create_task(self._evolution_loop())
-        logger.info("[Glorious Evolution] v1.0.4 启动完成 ✅")
+        logger.info("[Glorious Evolution] v1.0.5 启动完成 ✅")
 
     async def _delayed_scan_and_index(self):
         await asyncio.sleep(30)
@@ -526,11 +539,13 @@ class GloriousEvolutionPlugin(Star):
             except asyncio.CancelledError:
                 pass
             self._evo_task = None
+        # v1.0.5: 清理分类器注入任务
+        if self._classify_task and not self._classify_task.done():
+            self._classify_task.cancel()
 
     async def _evolution_loop(self) -> None:
         INTERVAL_SECONDS = 360 * 60
 
-        # 首轮先等待一个完整间隔，避免热重载/启动即触发复盘
         logger.info(f"[GE] 进化循环就绪，首轮将于 {INTERVAL_SECONDS//60} 分钟后执行")
         await asyncio.sleep(INTERVAL_SECONDS)
 
@@ -593,7 +608,6 @@ class GloriousEvolutionPlugin(Star):
 
         duration = time.time() - start_ts
 
-        # 更新统计
         self.evo_stats.increment("total_evolutions")
         self.evo_stats.increment("total_insights", result.get("insights", 0))
         self.evo_stats.increment("total_consolidations", result.get("consolidated", 0))
@@ -611,10 +625,12 @@ class GloriousEvolutionPlugin(Star):
 
     @filter.command("ges")
     async def cmd_stats(self, event: AstrMessageEvent):
-        mems = self.memory_store.count()
-        wins = sum(1 for m in self.memory_store.list_all() if m.get("win_rate", 0) >= 0.5)
-        win_rate = round(wins / mems * 100) if mems else 0
-        vec_ready = "✅" if self.vector_store.ready else "⏳"
+        """v1.0.5: 统一走 MemoryManager 统计，消除 JSON/SQLite 数据割裂"""
+        mgr_stats = await self._memory_mgr.get_stats()
+        mems = mgr_stats["total_memories"]
+        total_wins = mgr_stats.get("total_memories", 0)
+        win_rate = round(mgr_stats.get("avg_win_rate", 0) * 100) if mems else 0
+        vec_ready = "✅" if mgr_stats.get("embedding_ready") else "⏳"
         cls_ready = "✅" if self._classifier_llm else "⏳"
 
         msg = (
@@ -625,132 +641,73 @@ class GloriousEvolutionPlugin(Star):
         yield event.plain_result(msg)
 
 
-# ── 工具函数 ──
+# ═══════════════════════════════════════════════════════════════
+# 工具函数 (v1.0.5: 统一走 MemoryManager，消除 JSON/SQLite 双存储割裂)
+# ═══════════════════════════════════════════════════════════════
 
 async def store_memory(question: str, content: str, memory_type: str = "declarative", category: str = "general") -> str:
+    """统一走 MemoryManager (SQLite)，消除双存储割裂 (v1.0.5)"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
-    entry = {
-        "question": question,
-        "content": content,
-        "memory_type": memory_type,
-        "category": category,
-    }
-
-    if plugin._classifier_llm:
-        try:
-            classification = await classify_memory(question, content, plugin._classifier_llm)
-            entry["category"] = classification.get("category", category)
-            entry["memory_type"] = classification.get("memory_type", memory_type)
-            entry["tags"] = classification.get("tags", [])
-        except Exception:
-            pass
-
-    eid = plugin.memory_store.add(entry)
-    asyncio.create_task(plugin.vector_store.add(eid, _mem_to_text(entry)))
-    logger.info(f"[GE] 记忆已存储: {eid} ({entry.get('category')}/{entry.get('memory_type')})")
+    eid = await plugin._memory_mgr.add_memory(
+        question=question, content=content,
+        memory_type=memory_type, category=category,
+    )
+    logger.info(f"[GE] 记忆已存储: {eid}")
     return f"✅ 记忆已存储: {eid}"
 
 
 async def search_memory(query: str, top_k: int = 5) -> str:
+    """统一走 MemoryManager 检索 (v1.0.5)"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
-    results = []
-    if plugin.vector_store.ready:
-        vec_results = await plugin.vector_store.search(query, top_k)
-        for vr in vec_results:
-            mem = plugin.memory_store.get(vr["id"])
-            if mem:
-                results.append({
-                    "id": mem["id"],
-                    "question": mem.get("question", ""),
-                    "content": mem.get("content", ""),
-                    "category": mem.get("category", ""),
-                    "win_rate": mem.get("win_rate", 0),
-                    "distance": vr.get("distance"),
-                })
-
-    if not results:
-        query_lower = query.lower()
-        for m in plugin.memory_store.list_all():
-            if query_lower in _mem_to_text(m).lower():
-                results.append({
-                    "id": m["id"],
-                    "question": m.get("question", ""),
-                    "content": m.get("content", ""),
-                    "category": m.get("category", ""),
-                    "win_rate": m.get("win_rate", 0),
-                    "distance": None,
-                })
-                if len(results) >= top_k:
-                    break
-
-    if not results:
+    entries = await plugin._memory_mgr.retrieve_relevant_memories(query=query, top_k=top_k)
+    if not entries:
         return "🔍 未找到相关记忆"
-
     out = "🧠 相关记忆:\n"
-    for i, r in enumerate(results[:top_k], 1):
-        dist_str = f" [dist={r['distance']:.3f}]" if r["distance"] is not None else ""
-        out += f"{i}. [{r['id']}] ({r['category']}) win={r['win_rate']:.0%}{dist_str}\n"
-        out += f"   Q: {r['question'][:80]}\n"
-        out += f"   A: {r['content'][:120]}\n"
+    for i, e in enumerate(entries[:top_k], 1):
+        out += f"{i}. [{e.id}] ({e.category}) win={e.win_rate:.0%}\n"
+        out += f"   Q: {e.question[:80]}\n"
+        out += f"   A: {e.content[:120]}\n"
     return out
 
 
 async def update_win_rate(entry_id: str, success: bool) -> str:
+    """统一走 MemoryManager 更新胜率 (v1.0.5)"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
-    mem = plugin.memory_store.get(entry_id)
-    if not mem:
-        return f"❌ 记忆 {entry_id} 不存在"
-
-    old_rate = mem.get("win_rate", 0)
-    new_rate = round((old_rate * 0.7 + (1.0 if success else 0.0) * 0.3), 3)
-    plugin.memory_store.update(entry_id, {"win_rate": new_rate})
-
-    logger.info(f"[GE] win_rate 更新: {entry_id} {old_rate:.2f} → {new_rate:.2f}")
-    return f"📈 {entry_id} win_rate: {old_rate:.2f} → {new_rate:.2f}"
+    ok = await plugin._memory_mgr.update_win_rate(entry_id, success)
+    return f"📈 {entry_id} win_rate 已更新" if ok else f"❌ 记忆 {entry_id} 不存在"
 
 
 async def evict_memories() -> str:
+    """统一走 MemoryManager 淘汰 (v1.0.5)"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
-    evicted = []
-    for m in plugin.memory_store.list_all():
-        if m.get("win_rate", 1.0) < 0.1 and m.get("access_count", 0) >= 3:
-            await plugin.vector_store.delete(m["id"])
-            plugin.memory_store.delete(m["id"])
-            evicted.append(m["id"])
-
-    plugin.evo_stats.increment("total_evictions", len(evicted))
-    if not evicted:
-        return "🧹 无需淘汰"
-    logger.info(f"[GE] 已淘汰 {len(evicted)} 条记忆: {evicted}")
-    return f"🧹 已淘汰 {len(evicted)} 条: {', '.join(evicted)}"
+    n = await plugin._memory_mgr.evict_low_quality()
+    plugin.evo_stats.increment("total_evictions", n)
+    return f"🧹 已淘汰 {n} 条低质量记忆" if n else "🧹 无需淘汰"
 
 
 async def get_evolution_stats() -> str:
+    """v1.0.5: 从 MemoryManager 获取统计，与进化引擎一致"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
     stats = plugin.evo_stats.get_summary()
-    mems = plugin.memory_store.count()
-    vecs = plugin.vector_store.count()
-    vec_ok = "✅" if plugin.vector_store.ready else "⚠️"
+    mgr_stats = await plugin._memory_mgr.get_stats()
     return (
         f"📊 进化统计:\n"
-        f"📚 记忆: {mems} | 🧬 向量: {vecs} {vec_ok}\n"
-        f"🔄 总进化: {stats['total_evolutions']} | 💡 洞察: {stats['total_insights']} | 🗑️ 淘汰: {stats['total_evictions']}\n"
-        f"⏱️ 上次进化: {stats.get('last_evolution_at', 'N/A')} ({stats.get('last_evolution_duration_sec', 'N/A')}s)"
+        f"📚 记忆: {mgr_stats['total_memories']} | 🧬 向量: {mgr_stats['vector_index_size']}"
+        f" {'✅' if mgr_stats.get('embedding_ready') else '⚠️'}\n"
+        f"🔄 总进化: {stats['total_evolutions']} | 💡 洞察: {stats['total_insights']}"
+        f" | 🗑️ 淘汰: {stats['total_evictions']}\n"
+        f"⏱️ 上次进化: {stats.get('last_evolution_at', 'N/A')}"
+        f" ({stats.get('last_evolution_duration_sec', 'N/A')}s)"
     )
 
 
@@ -767,39 +724,23 @@ async def trigger_evolution() -> str:
 
 
 async def build_plan(question: str, extra_context: str = "") -> str:
+    """v1.0.5: 统一走 MemoryManager 检索"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
-    relevant = []
-    if plugin.vector_store.ready:
-        vec_results = await plugin.vector_store.search(question, 5)
-        for vr in vec_results:
-            mem = plugin.memory_store.get(vr["id"])
-            if mem and mem.get("win_rate", 0) > 0.3:
-                relevant.append(mem)
-
-    if not relevant:
-        for m in plugin.memory_store.list_all():
-            if question.lower() in _mem_to_text(m).lower() and m.get("win_rate", 0) > 0.3:
-                relevant.append(m)
-                if len(relevant) >= 5:
-                    break
-
-    context_parts = [f"[{r['id']}] win={r.get('win_rate',0):.0%}: {r.get('content', '')[:200]}" for r in relevant]
-    context_text = "\n".join(context_parts) if context_parts else "无相关记忆"
-
+    pos, neg = await plugin._memory_mgr.retrieve_balanced_memories(
+        query=question, pos_top_k=3, neg_top_k=2,
+    )
+    ctx_parts = []
+    for e in pos + neg:
+        ctx_parts.append(f"[{e.id}] win={e.win_rate:.0%}: {e.content[:150]}")
+    ctx = "\n".join(ctx_parts) if ctx_parts else "无相关记忆"
     return (
-        f"📋 计划 (基于 {len(relevant)} 条记忆):\n"
+        f"📋 计划 (正={len(pos)} 负={len(neg)}):\n"
         f"目标: {question}\n"
         f"{'额外上下文: ' + extra_context if extra_context else ''}\n"
-        f"────────────────\n"
-        f"📚 相关经验:\n{context_text}\n"
-        f"────────────────\n"
-        f"💡 建议步骤:\n"
-        f"1. 审查相关记忆中的成功/失败模式\n"
-        f"2. 优先采用高胜率 (>50%) 策略\n"
-        f"3. 执行后调用 update_win_rate 记录结果"
+        f"────────────────\n📚 相关经验:\n{ctx}\n────────────────\n"
+        f"💡 1.审查成功/失败模式 2.优先高胜率策略 3.执行后记录win_rate"
     )
 
 
@@ -814,34 +755,32 @@ async def judge_replan(execution_trace: str) -> str:
 
 
 async def build_replan(question: str, execution_trace: str) -> str:
+    """v1.0.5: 统一走 MemoryManager 检索"""
     plugin = _get_plugin()
-    if not plugin:
+    if not plugin or not plugin._memory_mgr:
         return "❌ 插件未就绪"
-
-    failure_mems = [m for m in plugin.memory_store.list_all()
-                    if m.get("win_rate", 0) < 0.5 and question.lower() in _mem_to_text(m).lower()]
-    avoid_list = "\n".join([f"- ❌ {m.get('content', '')[:150]}" for m in failure_mems[:3]]) if failure_mems else "无已知失败模式"
-
+    _, neg = await plugin._memory_mgr.retrieve_balanced_memories(
+        query=question, pos_top_k=2, neg_top_k=3,
+    )
+    avoid_lines = [f"- ❌ {e.content[:150]}" for e in neg[:3]]
+    avoid = "\n".join(avoid_lines) if avoid_lines else "无已知失败模式"
     return (
-        f"🔄 补充计划:\n"
-        f"原始目标: {question}\n"
-        f"失败轨迹: {execution_trace[:200]}\n"
-        f"────────────────\n"
-        f"⚠️ 应避免的策略:\n{avoid_list}\n"
-        f"────────────────\n"
-        f"💡 建议:\n"
-        f"1. 换用未被标记为失败的方案\n"
-        f"2. 尝试更简单的替代路径\n"
-        f"3. 成功/失败后调用 update_win_rate"
+        f"🔄 补充计划:\n原始目标: {question}\n失败轨迹: {execution_trace[:200]}\n"
+        f"⚠️ 应避免: {avoid}\n💡 1.换用未标记失败方案 2.尝试更简替代 3.记录win_rate"
     )
 
 
 def _get_plugin() -> Optional[GloriousEvolutionPlugin]:
+    """v1.0.5: 带缓存，避免每次全量遍历 GlobalStarMap"""
+    global _plugin_cache
+    if _plugin_cache is not None:
+        return _plugin_cache
     try:
         from astrbot.api.star import GlobalStarMap
         star_map = GlobalStarMap()
         for v in star_map.star_map.values():
             if isinstance(v, GloriousEvolutionPlugin):
+                _plugin_cache = v
                 return v
     except Exception:
         pass
