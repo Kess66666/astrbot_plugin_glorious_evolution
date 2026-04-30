@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.6 - JSON MemoryStore 降级只读 + numpy 批量向量检索 SIMD 加速
+v1.0.7 - ToolCallHook: 敏感信息脱敏拦截发往 LLM 的工具返回值
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,7 @@ from .storage import Storage
 from .memory_manager import MemoryManager
 from .reasoning_engine import ReasoningEngine
 from .evolution_task import EvolutionEngine
+from .tool_sanitizer import sanitize_content, sanitize_tool_output, ENABLE_SANITIZATION, STRICT_TOOL_NAMES
 
 # 上海时区
 CST = timezone(timedelta(hours=8))
@@ -37,7 +39,7 @@ EVO_STATS_FILE = os.path.join(PLUGIN_DIR, "evolution_stats.json")
 CHROMA_PATH = os.path.join(PLUGIN_DIR, "chroma_db")
 
 # ── 常量 ──
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -550,7 +552,7 @@ class GloriousEvolutionPlugin(Star):
         asyncio.create_task(self._delayed_scan_and_index())
 
         self._evo_task = asyncio.create_task(self._evolution_loop())
-        logger.info("[Glorious Evolution] v1.0.6 启动完成 ✅")
+        logger.info("[Glorious Evolution] v1.0.7 启动完成 ✅ (含 ToolCallHook 脱敏)")
 
     async def _delayed_scan_and_index(self):
         await asyncio.sleep(30)
@@ -655,6 +657,65 @@ class GloriousEvolutionPlugin(Star):
             f"evicted={result.get('evicted', 0)} "
             f"duration={duration:.1f}s"
         )
+
+    # ── ToolCallHook: 拦截所有工具返回值，脱敏敏感数据 (v1.0.7) ──
+
+    async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """注入到 AstrBot 的 LLM 请求钩子，对上下文中的工具返回结果做脱敏。
+
+        AstrBot 会在每次 LLM 调用前自动调用此方法，包括：
+        - 用户消息后的首轮 LLM 调用
+        - 工具执行完成后的后续 LLM 调用（此时上下文中含工具返回值）
+        """
+        if not ENABLE_SANITIZATION:
+            return
+
+        try:
+            # 脱敏 system_prompt
+            sp = getattr(req, "system_prompt", None)
+            if isinstance(sp, str) and len(sp) > 10:
+                req.system_prompt = sanitize_content(sp)
+
+            # 脱敏 prompt（可能是 str 或 list[dict]）
+            prompt = getattr(req, "prompt", None)
+            if isinstance(prompt, str) and len(prompt) > 10:
+                # 检测最近一次工具调用名，做针对性脱敏
+                tool_name = self._detect_last_tool(prompt)
+                if tool_name and tool_name in STRICT_TOOL_NAMES:
+                    req.prompt = sanitize_tool_output(tool_name, prompt)
+                else:
+                    req.prompt = sanitize_content(prompt)
+
+            elif isinstance(prompt, list):
+                # messages 格式：逐条脱敏
+                for msg in prompt:
+                    if isinstance(msg, dict):
+                        content = msg.get("content")
+                        if isinstance(content, str) and len(content) > 10:
+                            msg["content"] = sanitize_content(content)
+
+        except Exception as e:
+            logger.debug(f"[GE] ToolCallHook 脱敏异常 (已静默): {e}")
+
+    @staticmethod
+    def _detect_last_tool(prompt: str) -> Optional[str]:
+        """从 prompt 字符串中检测最近一次工具调用名。
+
+        匹配模式：
+        - "Tool Result (dev_read_file):" 
+        - "🔧 Tool: dev_read_file"
+        - "tool_call_id": "...", "name": "dev_read_file"
+        """
+        patterns = [
+            r'Tool Result \(([^)]+)\)',
+            r'🔧 Tool:\s*(\S+)',
+            r'"name":\s*"([^"]+)"',
+        ]
+        for pat in patterns:
+            matches = list(re.finditer(pat, prompt))
+            if matches:
+                return matches[-1].group(1)  # 取最后一次匹配
+        return None
 
     @filter.command("ges")
     async def cmd_stats(self, event: AstrMessageEvent):
