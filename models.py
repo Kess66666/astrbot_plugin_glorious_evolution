@@ -5,6 +5,7 @@ MIA 风格的记忆条目定义
 
 import json
 from dataclasses import dataclass, field
+import secrets
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -48,16 +49,23 @@ class MemoryEntry:
 
     def __post_init__(self) -> None:
         if not self.id:
-            self.id = f"MEM-{id(self) % 1000:03d}"
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            rand = secrets.token_hex(3)
+            self.id = f"MEM-{ts}-{rand}"
 
-    def update_win_rate(self, success: bool, decay_factor: float = 0.95) -> None:
+    def update_win_rate(self, success: bool, decay_factor: float = 0.0) -> None:
+        """更新胜率（默认使用 MIA 简单比值，与 MemoryManager 保持一致）。"""
         self.usage_count += 1
         if success:
             self.success_count += 1
-        self.win_rate = (
-            decay_factor * self.win_rate
-            + (1 - decay_factor) * (self.success_count / self.usage_count)
-        )
+        safe_usage = max(1, self.usage_count)
+        if decay_factor > 0:
+            self.win_rate = (
+                decay_factor * self.win_rate
+                + (1 - decay_factor) * (self.success_count / safe_usage)
+            )
+        else:
+            self.win_rate = self.success_count / safe_usage
         self.updated_at = datetime.now().isoformat()
 
     def to_db_dict(self) -> Dict[str, Any]:
