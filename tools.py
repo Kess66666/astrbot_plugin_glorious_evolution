@@ -1,8 +1,17 @@
+"""
+光荣进化系统 - LLM Tools（FunctionTool 子类）
+
+v1.0.12 修复:
+- 所有 Tool 的 run() → call()，签名对齐 AstrBot 框架约定
+- call(self, context: ContextWrapper, **kwargs) 避免 event/query 参数重复注入
+- 框架执行路径: handler → call override → run method
+  - call 方法: handler(context, **kwargs)  ✅ 正确
+  - run 方法: handler(event, **kwargs)      ❌ 旧写法导致 duplicate argument
+"""
+
 from typing import Optional
 
-from astrbot.core.agent.tool import FunctionTool
-
-from .models import Phase
+from astrbot.core.agent.tool import ContextWrapper, FunctionTool
 
 # ── 插件引用（由 main.py 注入） ──
 _plugin_cache: Optional["GloriousEvolutionPlugin"] = None
@@ -21,10 +30,12 @@ def _get_plugin() -> Optional["GloriousEvolutionPlugin"]:
     raise RuntimeError("GloriousEvolutionPlugin not initialized")
 
 
-# ── Tool 类定义 ──
+# ── Tool 类定义（均用 call 实例方法，对齐框架内置工具签名） ──
+
 
 class StoreMemoryTool(FunctionTool):
     """存储一条新记忆到知识库。"""
+
     def __init__(self):
         super().__init__(
             name="store_memory",
@@ -53,11 +64,9 @@ class StoreMemoryTool(FunctionTool):
                 },
                 "required": ["question", "content"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(question: str, content: str, memory_type: str = "declarative", category: str = "general") -> str:
+    async def call(self, context: ContextWrapper, question: str, content: str, memory_type: str = "declarative", category: str = "general") -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -69,6 +78,7 @@ class StoreMemoryTool(FunctionTool):
 
 class SearchMemoryTool(FunctionTool):
     """检索相关记忆。"""
+
     def __init__(self):
         super().__init__(
             name="search_memory",
@@ -87,11 +97,9 @@ class SearchMemoryTool(FunctionTool):
                 },
                 "required": ["query"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(query: str, top_k: int = 5) -> str:
+    async def call(self, context: ContextWrapper, query: str, top_k: int = 5) -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -108,6 +116,7 @@ class SearchMemoryTool(FunctionTool):
 
 class UpdateWinRateTool(FunctionTool):
     """更新记忆胜率。"""
+
     def __init__(self):
         super().__init__(
             name="update_win_rate",
@@ -126,11 +135,9 @@ class UpdateWinRateTool(FunctionTool):
                 },
                 "required": ["entry_id", "success"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(entry_id: str, success: bool) -> str:
+    async def call(self, context: ContextWrapper, entry_id: str, success: bool) -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -140,16 +147,15 @@ class UpdateWinRateTool(FunctionTool):
 
 class EvictMemoriesTool(FunctionTool):
     """淘汰低质量记忆。"""
+
     def __init__(self):
         super().__init__(
             name="evict_memories",
             description="Evict low-quality memories from the knowledge base. Removes entries with low usage count AND low win_rate. Call this periodically to keep the memory bank clean and efficient.",
             parameters={"type": "object", "properties": {}},
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run() -> str:
+    async def call(self, context: ContextWrapper) -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -160,16 +166,15 @@ class EvictMemoriesTool(FunctionTool):
 
 class GetEvolutionStatsTool(FunctionTool):
     """获取进化系统统计信息。"""
+
     def __init__(self):
         super().__init__(
             name="get_evolution_stats",
             description="Get statistics about the Glorious Evolution system: total memories, win rates, vector index status, evolution cycle count, and insights generated. Use this to understand the system's current knowledge state.",
             parameters={"type": "object", "properties": {}},
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run() -> str:
+    async def call(self, context: ContextWrapper) -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -189,16 +194,15 @@ class GetEvolutionStatsTool(FunctionTool):
 
 class TriggerEvolutionTool(FunctionTool):
     """手动触发进化周期。"""
+
     def __init__(self):
         super().__init__(
             name="trigger_evolution",
             description="Manually trigger a full evolution cycle: consolidate episodic memories into declarative rules, generate insights from win_rate patterns, and evict low-quality memories. The system auto-runs this every 6 hours, but you can call it on-demand after storing many new memories.",
             parameters={"type": "object", "properties": {}},
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run() -> str:
+    async def call(self, context: ContextWrapper) -> str:
         plugin = _get_plugin()
         if not plugin:
             return "❌ plugin not ready"
@@ -212,6 +216,7 @@ class TriggerEvolutionTool(FunctionTool):
 
 class BuildPlanTool(FunctionTool):
     """构建行动计划。"""
+
     def __init__(self):
         super().__init__(
             name="build_plan",
@@ -224,11 +229,9 @@ class BuildPlanTool(FunctionTool):
                 },
                 "required": ["question"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(question: str, extra_context: str = "") -> str:
+    async def call(self, context: ContextWrapper, question: str, extra_context: str = "") -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -248,6 +251,7 @@ class BuildPlanTool(FunctionTool):
 
 class JudgeReplanTool(FunctionTool):
     """判断是否需要重新规划。"""
+
     def __init__(self):
         super().__init__(
             name="judge_replan",
@@ -259,11 +263,9 @@ class JudgeReplanTool(FunctionTool):
                 },
                 "required": ["execution_trace"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(execution_trace: str) -> str:
+    async def call(self, context: ContextWrapper, execution_trace: str) -> str:
         plugin = _get_plugin()
         if not plugin:
             return "❌ plugin not ready"
@@ -282,6 +284,7 @@ class JudgeReplanTool(FunctionTool):
 
 class BuildReplanTool(FunctionTool):
     """构建修订计划。"""
+
     def __init__(self):
         super().__init__(
             name="build_replan",
@@ -294,11 +297,9 @@ class BuildReplanTool(FunctionTool):
                 },
                 "required": ["question", "execution_trace"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(question: str, execution_trace: str) -> str:
+    async def call(self, context: ContextWrapper, question: str, execution_trace: str) -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
@@ -315,10 +316,22 @@ class BuildReplanTool(FunctionTool):
 
 class RunAgentLoopTool(FunctionTool):
     """运行 Agent 循环。"""
+
     def __init__(self):
         super().__init__(
             name="run_agent_loop",
-            description="【State-Driven Agent Loop】状态机驱动的混合推理循环。\nUsage (manual mode):\n1. `run_agent_loop(goal='...')` → 返回计划，等待你执行\n2. 执行步骤后 → `run_agent_loop(goal='...', execution_trace='...')` → 评判 + (重规划 | 完成)\n3. 重复直到完成\nUsage (background mode):\n`run_agent_loop(goal='...', mode='background')` → 后台自主运行，不返回中间结果\n\nFixed Action flow: BUILD_PLAN → EXECUTE_PLAN → JUDGE_RESULT → (BUILD_REPLAN → EXECUTE_REPLAN → JUDGE_RESULT | FINISH)\nState machine controls the flow; LLM only assists with planning & judging.",
+            description=(
+                "【State-Driven Agent Loop】状态机驱动的混合推理循环。\n"
+                "Usage (manual mode):\n"
+                "1. `run_agent_loop(goal='...')` → 返回计划，等待你执行\n"
+                "2. 执行步骤后 → `run_agent_loop(goal='...', execution_trace='...')` → 评判 + (重规划 | 完成)\n"
+                "3. 重复直到完成\n"
+                "Usage (background mode):\n"
+                "`run_agent_loop(goal='...', mode='background')` → 后台自主运行，不返回中间结果\n\n"
+                "Fixed Action flow: BUILD_PLAN → EXECUTE_PLAN → JUDGE_RESULT → "
+                "(BUILD_REPLAN → EXECUTE_REPLAN → JUDGE_RESULT | FINISH)\n"
+                "State machine controls the flow; LLM only assists with planning & judging."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -329,11 +342,9 @@ class RunAgentLoopTool(FunctionTool):
                 },
                 "required": ["goal"],
             },
-            handler=self._run,
         )
 
-    @staticmethod
-    async def _run(goal: str, execution_trace: str = "", max_iterations: int = 3, mode: str = "manual") -> str:
+    async def call(self, context: ContextWrapper, goal: str, execution_trace: str = "", max_iterations: int = 3, mode: str = "manual") -> str:
         plugin = _get_plugin()
         if not plugin:
             return "❌ plugin not ready"
@@ -342,8 +353,10 @@ class RunAgentLoopTool(FunctionTool):
             return "❌ agent loop not initialized"
         if mode == "background":
             import asyncio
+
             async def _bg():
                 return await loop.run_in_background(goal, max_iterations=max_iterations)
+
             asyncio.create_task(_bg())
             return f"🔄 Agent loop started in background: {goal[:80]}..."
         return await loop.process(goal, execution_trace=execution_trace, max_iterations=max_iterations)

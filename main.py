@@ -535,7 +535,6 @@ class GloriousEvolutionPlugin(Star):
             await self._init_embedding_provider()
         except Exception as e:
             logger.error(f"[GE] embedding init failed: {e}")
-        # 异步初始化分类器，不阻塞插件加载
         asyncio.create_task(self._init_classifier())
         try:
             await self._scan_and_index()
