@@ -40,7 +40,7 @@ CST = timezone(timedelta(hours=8))
 
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/AstrBot/data/glorious_evolution"
-BACKUP_DIR = "/AstrBot/data/workspaces/telegram_FriendMessage_7223158438/glorious-evolution/backups"
+BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 
 OLD_DB_PATH = os.path.join(PLUGIN_DIR, "evolution.db")
 OLD_CHROMA_PATH = os.path.join(PLUGIN_DIR, "chroma_db")
