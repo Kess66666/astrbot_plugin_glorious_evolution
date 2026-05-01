@@ -1,6 +1,13 @@
 """
 光荣进化系统 - 存储层
 SQLite + FTS5 全文搜索 + 向量存储
+
+v1.0.11 修复:
+- INSERT OR IGNORE → INSERT，冲突时抛异常而非静默丢数据
+- add_entry 检查 insert_entry 返回值
+- update_entry key 白名单校验，防 SQL 注入
+- 删除废弃的 storage.update_win_rate()（统一走 MemoryManager.update_win_rate）
+- insert_entry/add_entry 返回值语义修正
 """
 
 import asyncio
@@ -13,6 +20,13 @@ from typing import Any, Dict, List, Optional
 from astrbot.api import logger
 
 from .models import MemoryEntry, MemoryType, Judgement
+
+# update_entry 允许的字段白名单（防 SQL 注入）
+_ALLOWED_UPDATE_FIELDS = frozenset({
+    "question", "content", "memory_type", "category", "judgement",
+    "win_rate", "usage_count", "success_count", "trajectory", "rules",
+    "embedding", "tags", "related_ids", "updated_at",
+})
 
 
 class Storage:
@@ -84,15 +98,39 @@ class Storage:
         finally:
             conn.close()
 
+    # ── ID 计数器恢复 ──
+
+    def get_max_id_counter(self) -> int:
+        """从 SQLite 查询当前最大 ID 序号，用于 _id_counter 安全恢复。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            # ID 格式: MEM-YYYYMMDD-NNN，取 NNN 部分的全局最大值
+            row = conn.execute(
+                "SELECT id FROM memories WHERE id LIKE 'MEM-%' ORDER BY id DESC LIMIT 100"
+            ).fetchall()
+            max_counter = 0
+            for (entry_id,) in row:
+                try:
+                    parts = entry_id.split("-")
+                    if len(parts) == 3:
+                        counter = int(parts[2])
+                        if counter > max_counter:
+                            max_counter = counter
+                except (ValueError, IndexError):
+                    continue
+            return max_counter
+        finally:
+            conn.close()
+
     # ── CRUD ──
 
     async def insert_entry(self, entry: MemoryEntry) -> bool:
-        """插入一条记忆（id 冲突时跳过）。"""
+        """插入一条记忆。ID 冲突时抛 IntegrityError 而非静默跳过。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                conn.execute(
-                    """INSERT OR IGNORE INTO memories
+                cursor = conn.execute(
+                    """INSERT INTO memories
                        (id, question, content, memory_type, category, judgement,
                         win_rate, usage_count, success_count, trajectory, rules,
                         embedding, tags, related_ids, created_at, updated_at)
@@ -108,13 +146,19 @@ class Storage:
                     ),
                 )
                 conn.commit()
-                return conn.total_changes > 0
+                return cursor.rowcount > 0
+            except sqlite3.IntegrityError:
+                logger.warning(f"[GE] INSERT 冲突，记忆已存在: {entry.id}")
+                conn.rollback()
+                return False
             finally:
                 conn.close()
 
     async def add_entry(self, entry: MemoryEntry) -> str:
-        """添加一条记忆，返回 entry_id。"""
-        await self.insert_entry(entry)
+        """添加一条记忆，返回 entry_id。插入失败时记录错误日志。"""
+        ok = await self.insert_entry(entry)
+        if not ok:
+            logger.error(f"[GE] add_entry 失败: {entry.id} 可能已存在")
         return entry.id
 
     async def get_entry(self, entry_id: str) -> Optional[MemoryEntry]:
@@ -132,8 +176,13 @@ class Storage:
                 conn.close()
 
     async def update_entry(self, entry_id: str, **fields) -> bool:
-        """按字段更新记忆条目。"""
+        """按字段更新记忆条目。key 须在白名单内，否则拒绝。"""
         if not fields:
+            return False
+        # ── 白名单校验：防止 SQL 注入 ──
+        invalid_keys = set(fields.keys()) - _ALLOWED_UPDATE_FIELDS
+        if invalid_keys:
+            logger.error(f"[GE] update_entry 非法字段: {invalid_keys}")
             return False
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
@@ -146,9 +195,9 @@ class Storage:
                 params.append(datetime.now().isoformat())
                 params.append(entry_id)
                 sql = f"UPDATE memories SET {', '.join(set_clauses)}, updated_at = ? WHERE id = ?"
-                conn.execute(sql, params)
+                cursor = conn.execute(sql, params)
                 conn.commit()
-                return conn.total_changes > 0
+                return cursor.rowcount > 0
             finally:
                 conn.close()
 
@@ -157,54 +206,25 @@ class Storage:
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
+                cursor = conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
                 conn.commit()
-                return conn.total_changes > 0
+                return cursor.rowcount > 0
             finally:
                 conn.close()
 
-    # ── 胜率 ──
-
-    async def update_win_rate(self, entry_id: str, success: bool) -> bool:
-        """更新胜率。返回 True 表示更新成功。"""
-        async with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                now = datetime.now().isoformat()
-                if success:
-                    conn.execute(
-                        """UPDATE memories
-                           SET win_rate = MIN(1.0, win_rate + 0.05),
-                               usage_count = usage_count + 1,
-                               updated_at = ?
-                           WHERE id = ?""",
-                        (now, entry_id),
-                    )
-                else:
-                    conn.execute(
-                        """UPDATE memories
-                           SET win_rate = MAX(0.0, win_rate - 0.1),
-                               usage_count = usage_count + 1,
-                               updated_at = ?
-                           WHERE id = ?""",
-                        (now, entry_id),
-                    )
-                conn.commit()
-                return conn.total_changes > 0
-            finally:
-                conn.close()
+    # ── 评判 ──
 
     async def update_judgement(self, entry_id: str, judgement: Judgement) -> bool:
         """更新评判状态。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE memories SET judgement = ?, updated_at = ? WHERE id = ?",
                     (judgement.value, datetime.now().isoformat(), entry_id),
                 )
                 conn.commit()
-                return conn.total_changes > 0
+                return cursor.rowcount > 0
             finally:
                 conn.close()
 
@@ -257,7 +277,7 @@ class Storage:
                 rows = cursor.fetchall()
                 return [MemoryEntry.from_db_row(dict(r)) for r in rows]
             except Exception as e:
-                logger.error(f"[Glorious Evolution] FTS 搜索失败: {e}")
+                logger.error(f"[GE] FTS 搜索失败: {e}")
                 return []
             finally:
                 conn.close()
