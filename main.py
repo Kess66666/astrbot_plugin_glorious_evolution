@@ -93,7 +93,6 @@ async def _auto_backup(source_path: str, label: str) -> Optional[str]:
     await asyncio.get_event_loop().run_in_executor(None, shutil.copy2, source_path, dest)
     size_kb = os.path.getsize(dest) / 1024
     logger.info(f"[GE] backup: {os.path.basename(dest)} ({size_kb:.0f} KB)")
-    # 轮转清理：每类文件只保留最近 5 份
     await _auto_rotate_backups(source_path)
     return dest
 
@@ -109,7 +108,6 @@ async def _auto_rotate_backups(source_path: str, keep: int = 5) -> None:
         for entry in os.scandir(BACKUP_DIR):
             if entry.is_file() and entry.name.startswith(prefix):
                 candidates.append((entry.path, os.path.getmtime(entry.path)))
-        # 按修改时间降序排序，保留前 keep 个
         candidates.sort(key=lambda x: x[1], reverse=True)
         for path, _ in candidates[keep:]:
             os.remove(path)
@@ -210,7 +208,11 @@ class VectorStore:
             return
         try:
             vec = await self._embed_fn([text])
-            self._collection.add(ids=[entry_id], embeddings=vec, metadatas=[metadata or {}])
+            self._collection.add(
+                ids=[entry_id],
+                embeddings=vec,
+                metadatas=[metadata if metadata else {"source": "ge"}],
+            )
         except Exception as e:
             logger.warning(f"[GE] vector add failed ({entry_id}): {e}")
 
@@ -387,7 +389,7 @@ class GloriousEvolutionPlugin(Star):
         self._agent_loop_task: Optional[asyncio.Task] = None
         self._agent_loop: Optional[AgentLoop] = None
         self._classifier_llm = None
-        self._storage = Storage(DATA_DIR)
+        self._storage = Storage(DB_PATH)
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
@@ -533,10 +535,8 @@ class GloriousEvolutionPlugin(Star):
             await self._init_embedding_provider()
         except Exception as e:
             logger.error(f"[GE] embedding init failed: {e}")
-        try:
-            await self._init_classifier()
-        except Exception as e:
-            logger.error(f"[GE] classifier init failed: {e}")
+        # 异步初始化分类器，不阻塞插件加载
+        asyncio.create_task(self._init_classifier())
         try:
             await self._scan_and_index()
         except Exception as e:
@@ -713,7 +713,6 @@ class GloriousEvolutionPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        # ── 脱敏（可配置关闭）──
         if ENABLE_SANITIZATION:
             try:
                 sp = getattr(req, "system_prompt", None)
@@ -734,11 +733,9 @@ class GloriousEvolutionPlugin(Star):
                                 msg["content"] = sanitize_content(content)
             except Exception as e:
                 logger.debug(f"[GE] ToolCallHook sanitize error (silenced): {e}")
-        # ── 记忆注入：检索相关记忆，注入到 system prompt，形成闭环 ──
         await self._inject_relevant_memories(req)
 
     async def _inject_relevant_memories(self, req: ProviderRequest) -> None:
-        """自动检索相关记忆并注入到 system prompt，形成记忆闭环。"""
         if not self._memory_mgr:
             return
         prompt = getattr(req, "prompt", "")
@@ -789,142 +786,3 @@ class GloriousEvolutionPlugin(Star):
             f"🧬 Full MIA: Memory + Reasoning + Evolution + Classification ✅"
         )
         yield event.plain_result(msg)
-
-
-async def store_memory(question: str, content: str, memory_type: str = "declarative", category: str = "general") -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    eid = await plugin._memory_mgr.add_memory(
-        question=question, content=content, memory_type=memory_type, category=category,
-    )
-    logger.info(f"[GE] memory stored: {eid}")
-    return f"✅ memory stored: {eid}"
-
-
-async def search_memory(query: str, top_k: int = 5) -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    entries = await plugin._memory_mgr.retrieve_relevant_memories(query=query, top_k=top_k)
-    if not entries:
-        return "🔍 no results"
-    out = "🧠 relevant memories:\n"
-    for i, e in enumerate(entries[:top_k], 1):
-        out += f"{i}. [{e.id}] ({e.category}) win={e.win_rate:.0%}\n"
-        out += f"   Q: {e.question[:80]}\n"
-        out += f"   A: {e.content[:120]}\n"
-    return out
-
-
-async def update_win_rate(entry_id: str, success: bool) -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    ok = await plugin._memory_mgr.update_win_rate(entry_id, success)
-    return f"📈 {entry_id} win_rate updated" if ok else f"❌ {entry_id} not found"
-
-
-async def evict_memories() -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    n = await plugin._memory_mgr.evict_low_quality()
-    plugin.evo_stats.increment("total_evictions", n)
-    return f"🧹 evicted {n} low-quality memories" if n else "🧹 nothing to evict"
-
-
-async def get_evolution_stats() -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    stats = plugin.evo_stats.get_summary()
-    mgr_stats = await plugin._memory_mgr.get_stats()
-    return (
-        f"📊 evolution stats:\n"
-        f"📚 memories: {mgr_stats['total_memories']} | 🧬 vectors: {mgr_stats['vector_index_size']}"
-        f" {'✅' if mgr_stats.get('embedding_ready') else '⚠️'}\n"
-        f"🔄 evolutions: {stats['total_evolutions']} | 💡 insights: {stats['total_insights']}"
-        f" | 🗑️ evicted: {stats['total_evictions']}\n"
-        f"⏱️ last: {stats.get('last_evolution_at', 'N/A')}"
-        f" ({stats.get('last_evolution_duration_sec', 'N/A')}s)\n"
-        f"💾 data: {DATA_DIR}"
-    )
-
-
-async def trigger_evolution() -> str:
-    plugin = _get_plugin()
-    if not plugin:
-        return "❌ plugin not ready"
-    try:
-        await asyncio.wait_for(plugin._run_evolution(), timeout=120)
-        asyncio.create_task(_backup_all(label="manual"))
-        return "🧬 evolution cycle complete ✅"
-    except asyncio.TimeoutError:
-        return "⚠️ evolution timeout (2min)"
-
-
-async def build_plan(question: str, extra_context: str = "") -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    pos, neg = await plugin._memory_mgr.retrieve_balanced_memories(
-        query=question, pos_top_k=3, neg_top_k=2,
-    )
-    ctx_parts = [f"[{e.id}] win={e.win_rate:.0%}: {e.content[:150]}" for e in pos + neg]
-    ctx = "\n".join(ctx_parts) if ctx_parts else "no relevant memories"
-    return (
-        f"📋 plan (pos={len(pos)} neg={len(neg)}):\n"
-        f"goal: {question}\n"
-        f"{'extra context: ' + extra_context if extra_context else ''}\n"
-        f"────────────────\n📚 experience:\n{ctx}\n────────────────\n"
-        f"💡 1.review success/failure patterns 2.prefer high-win strategies 3.record win_rate"
-    )
-
-
-async def judge_replan(execution_trace: str) -> str:
-    plugin = _get_plugin()
-    if not plugin:
-        return "❌ plugin not ready"
-    if plugin._reasoning_engine:
-        try:
-            result = await plugin._reasoning_engine.judge_replan(
-                event=None, execution_trace=execution_trace,
-            )
-            return "🔄 replan suggested" if result == "yes" else "✅ no replan needed"
-        except RuntimeError:
-            pass
-    failure_keywords = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]
-    has_failure = any(kw in execution_trace.lower() for kw in failure_keywords)
-    return "🔄 replan suggested" if has_failure else "✅ no replan needed"
-
-
-async def build_replan(question: str, execution_trace: str) -> str:
-    plugin = _get_plugin()
-    if not plugin or not plugin._memory_mgr:
-        return "❌ plugin not ready"
-    _, neg = await plugin._memory_mgr.retrieve_balanced_memories(
-        query=question, pos_top_k=2, neg_top_k=3,
-    )
-    avoid_lines = [f"- ❌ {e.content[:150]}" for e in neg[:3]]
-    avoid = "\n".join(avoid_lines) if avoid_lines else "no known failure patterns"
-    return (
-        f"🔄 replan:\noriginal: {question}\nfailure trace: {execution_trace[:200]}\n"
-        f"⚠️ avoid: {avoid}\n💡 1.try different approach 2.simplify 3.record win_rate"
-    )
-
-
-def _get_plugin() -> Optional[GloriousEvolutionPlugin]:
-    global _plugin_cache
-    if _plugin_cache is not None:
-        return _plugin_cache
-    try:
-        from astrbot.api.star import GlobalStarMap
-        star_map = GlobalStarMap()
-        for v in star_map.star_map.values():
-            if isinstance(v, GloriousEvolutionPlugin):
-                _plugin_cache = v
-                return v
-    except Exception:
-        pass
-    return None

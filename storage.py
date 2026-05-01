@@ -25,10 +25,14 @@ class Storage:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._lock = asyncio.Lock()
+        # 确保父目录存在，避免 sqlite3.OperationalError: unable to open database file
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        logger.info(f"[GE] Storage db_path={db_path}, exists={os.path.exists(db_path)}")
         self._init_db()
 
     def _init_db(self) -> None:
         """初始化数据库表（若不存在）。"""
+        logger.info(f"[GE] _init_db connecting to: {self.db_path}")
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -45,6 +49,12 @@ class Storage:
                     judgement TEXT NOT NULL DEFAULT 'pending',
                     win_rate REAL NOT NULL DEFAULT 0.5,
                     usage_count INTEGER NOT NULL DEFAULT 0,
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    trajectory TEXT NOT NULL DEFAULT '',
+                    rules TEXT NOT NULL DEFAULT '',
+                    embedding TEXT,
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    related_ids TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -53,7 +63,6 @@ class Storage:
                     question, content, content=memories, content_rowid=rowid
                 );
 
-                -- 触发器保持 FTS 索引同步
                 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
                     INSERT INTO memories_fts(rowid, question, content)
                     VALUES (new.rowid, new.question, new.content);
@@ -75,6 +84,8 @@ class Storage:
         finally:
             conn.close()
 
+    # ── CRUD ──
+
     async def insert_entry(self, entry: MemoryEntry) -> bool:
         """插入一条记忆（id 冲突时跳过）。"""
         async with self._lock:
@@ -83,25 +94,76 @@ class Storage:
                 conn.execute(
                     """INSERT OR IGNORE INTO memories
                        (id, question, content, memory_type, category, judgement,
-                        win_rate, usage_count, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        win_rate, usage_count, success_count, trajectory, rules,
+                        embedding, tags, related_ids, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        entry.id,
-                        entry.question,
-                        entry.content,
-                        entry.memory_type.value,
-                        entry.category,
-                        entry.judgement.value,
-                        entry.win_rate,
-                        entry.usage_count,
-                        entry.created_at,
-                        entry.updated_at,
+                        entry.id, entry.question, entry.content,
+                        entry.memory_type.value, entry.category, entry.judgement.value,
+                        entry.win_rate, entry.usage_count, entry.success_count,
+                        entry.trajectory, entry.rules,
+                        entry.to_db_dict().get("embedding"),
+                        json.dumps(entry.tags), json.dumps(entry.related_ids),
+                        entry.created_at, entry.updated_at,
                     ),
                 )
                 conn.commit()
                 return conn.total_changes > 0
             finally:
                 conn.close()
+
+    async def add_entry(self, entry: MemoryEntry) -> str:
+        """添加一条记忆，返回 entry_id。"""
+        await self.insert_entry(entry)
+        return entry.id
+
+    async def get_entry(self, entry_id: str) -> Optional[MemoryEntry]:
+        """按 ID 获取单条记忆。"""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT * FROM memories WHERE id = ?", (entry_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return MemoryEntry.from_db_row(dict(row))
+            finally:
+                conn.close()
+
+    async def update_entry(self, entry_id: str, **fields) -> bool:
+        """按字段更新记忆条目。"""
+        if not fields:
+            return False
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                set_clauses = []
+                params = []
+                for key, value in fields.items():
+                    set_clauses.append(f"{key} = ?")
+                    params.append(value)
+                params.append(datetime.now().isoformat())
+                params.append(entry_id)
+                sql = f"UPDATE memories SET {', '.join(set_clauses)}, updated_at = ? WHERE id = ?"
+                conn.execute(sql, params)
+                conn.commit()
+                return conn.total_changes > 0
+            finally:
+                conn.close()
+
+    async def delete_entry(self, entry_id: str) -> bool:
+        """删除一条记忆。"""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
+                conn.commit()
+                return conn.total_changes > 0
+            finally:
+                conn.close()
+
+    # ── 胜率 ──
 
     async def update_win_rate(self, entry_id: str, success: bool) -> bool:
         """更新胜率。返回 True 表示更新成功。"""
@@ -146,27 +208,15 @@ class Storage:
             finally:
                 conn.close()
 
-    async def delete_entry(self, entry_id: str) -> bool:
-        """删除一条记忆。"""
-        async with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
-                conn.commit()
-                return conn.total_changes > 0
-            finally:
-                conn.close()
+    # ── 搜索 ──
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
         """净化 FTS5 查询字符串，避免特殊字符触发语法错误。"""
-        # 去掉 FTS5 的保留字符，用空格替换
         import re
         safe = re.sub(r'[^\w\u4e00-\u9fff]', ' ', query)
-        # 避免空查询
         if not safe.strip():
             return '""'
-        # 分词后用 OR 连接
         terms = safe.split()
         if not terms:
             return '""'
@@ -184,24 +234,18 @@ class Storage:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
-
                 where_clauses = []
                 params: list[Any] = []
-
                 if memory_type:
                     where_clauses.append("memory_type = ?")
                     params.append(memory_type)
                 if min_win_rate > 0:
                     where_clauses.append("win_rate >= ?")
                     params.append(min_win_rate)
-
                 where_sql = ""
                 if where_clauses:
                     where_sql = "AND " + " AND ".join(where_clauses)
-
-                # 净化查询，防止 v1.0.0 这类关键词触发 FTS5 语法错误
                 safe_query = self._sanitize_fts5_query(query)
-
                 cursor = conn.execute(
                     f"""SELECT m.* FROM memories m
                         JOIN memories_fts fts ON m.rowid = fts.rowid
@@ -217,6 +261,8 @@ class Storage:
                 return []
             finally:
                 conn.close()
+
+    # ── 批量读取 ──
 
     async def get_all_entries(self, limit: int = 1000) -> List[MemoryEntry]:
         """获取所有记忆条目"""
@@ -234,20 +280,14 @@ class Storage:
                 conn.close()
 
     async def get_entries_by_ids(self, entry_ids: List[str]) -> Dict[str, MemoryEntry]:
-        """按 ID 列表批量获取记忆条目，返回 {id: MemoryEntry} 映射。
-
-        用于向量检索后的精排阶段——从候选 ID 批量加载完整条目。
-        自动按 500 分批，控制 IN 子句大小。
-        """
+        """按 ID 列表批量获取记忆条目，返回 {id: MemoryEntry} 映射。"""
         if not entry_ids:
             return {}
-
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
                 result: Dict[str, MemoryEntry] = {}
-
                 chunk_size = 500
                 for i in range(0, len(entry_ids), chunk_size):
                     chunk = entry_ids[i:i + chunk_size]
@@ -259,10 +299,11 @@ class Storage:
                     for row in cursor:
                         entry = MemoryEntry.from_db_row(dict(row))
                         result[entry.id] = entry
-
                 return result
             finally:
                 conn.close()
+
+    # ── 统计 ──
 
     async def get_statistics(self) -> Dict[str, Any]:
         """获取统计快照"""
@@ -270,46 +311,24 @@ class Storage:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
-
-                total = conn.execute(
-                    "SELECT COUNT(*) as cnt FROM memories"
-                ).fetchone()["cnt"]
-
-                avg_wr = conn.execute(
-                    "SELECT AVG(win_rate) as avg FROM memories"
-                ).fetchone()["avg"] or 0
-
-                # 按类型统计
+                total = conn.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
+                avg_wr = conn.execute("SELECT AVG(win_rate) as avg FROM memories").fetchone()["avg"] or 0
                 by_type = {}
-                for row in conn.execute(
-                    "SELECT memory_type, COUNT(*) as cnt FROM memories GROUP BY memory_type"
-                ):
+                for row in conn.execute("SELECT memory_type, COUNT(*) as cnt FROM memories GROUP BY memory_type"):
                     by_type[row["memory_type"]] = row["cnt"]
-
-                # 按评判统计
                 by_judgement = {}
-                for row in conn.execute(
-                    "SELECT judgement, COUNT(*) as cnt FROM memories GROUP BY judgement"
-                ):
+                for row in conn.execute("SELECT judgement, COUNT(*) as cnt FROM memories GROUP BY judgement"):
                     by_judgement[row["judgement"]] = row["cnt"]
-
-                # 胜率 Top 5
+                by_category = {}
+                for row in conn.execute("SELECT category, COUNT(*) as cnt FROM memories GROUP BY category"):
+                    by_category[row["category"]] = row["cnt"]
                 top_wr = []
-                for row in conn.execute(
-                    "SELECT id, win_rate, usage_count FROM memories ORDER BY win_rate DESC LIMIT 5"
-                ):
-                    top_wr.append({
-                        "id": row["id"],
-                        "win_rate": row["win_rate"],
-                        "usage_count": row["usage_count"],
-                    })
-
+                for row in conn.execute("SELECT id, win_rate, usage_count FROM memories ORDER BY win_rate DESC LIMIT 5"):
+                    top_wr.append({"id": row["id"], "win_rate": row["win_rate"], "usage_count": row["usage_count"]})
                 return {
-                    "total_memories": total,
-                    "avg_win_rate": avg_wr,
-                    "by_type": by_type,
-                    "by_judgement": by_judgement,
-                    "top_win_rate": top_wr,
+                    "total_memories": total, "avg_win_rate": avg_wr,
+                    "by_type": by_type, "by_judgement": by_judgement,
+                    "by_category": by_category, "top_win_rate": top_wr,
                 }
             finally:
                 conn.close()
