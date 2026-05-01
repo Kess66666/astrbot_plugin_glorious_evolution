@@ -37,7 +37,7 @@ def _lazy_import_numpy() -> Optional[Any]:
 
 class MemoryManager:
     DECAY_FACTOR: float = 0.0
-    EVICT_MIN_USAGE: int = 3
+    EVICT_MIN_USAGE: int = 3      # 必须至少用过 3 次才参与淘汰
     EVICT_MAX_WIN_RATE: float = 0.2
 
     def __init__(self, storage: Storage) -> None:
@@ -77,12 +77,14 @@ class MemoryManager:
             self._vectors[entry_id] = (np.array(embedding, dtype=np.float32), win_rate)
 
     async def load_vectors(self) -> None:
-        entries = await self.storage.get_all_entries(limit=10000)
+        """加载向量索引 + 安全恢复 _id_counter。"""
+        entries = await self.storage.get_all_memories(limit=10000)
         loaded = 0
         for entry in entries:
             if entry.embedding is not None:
                 self._add_vector(entry.id, entry.embedding, entry.win_rate)
                 loaded += 1
+        # ── 从 SQLite MAX(id) 安全恢复计数器 ──
         db_max = self.storage.get_max_id_counter()
         self._id_counter = max(len(entries), db_max)
         logger.info(
@@ -306,6 +308,7 @@ class MemoryManager:
         return [entry for _, entry in scored_entries[:top_k]]
 
     async def update_win_rate(self, entry_id: str, success: bool) -> bool:
+        """统一胜率更新入口（唯一公式来源）。"""
         entry = await self.storage.get_entry(entry_id)
         if entry is None:
             logger.warning(f"[GE] 胜率更新失败，记忆不存在: {entry_id}")
@@ -330,10 +333,19 @@ class MemoryManager:
             self._vectors[entry_id] = (vec, entry.win_rate)
         return ok
 
+    async def get_all_memories(self, limit: int = 10000) -> List[MemoryEntry]:
+        """封装 storage.get_all_memories，避免外部直接操作 storage。"""
+        return await self.storage.get_all_memories(limit=limit)
+
+    async def get_memories_by_type(self, memory_type: str, limit: int = 500) -> List[MemoryEntry]:
+        """按类型获取记忆（SQL 层过滤，推荐用于 consolidation / insight 等场景）。"""
+        return await self.storage.get_memories_by_type(memory_type=memory_type, limit=limit)
+
     async def evict_low_quality(self) -> int:
-        entries = await self.storage.get_all_entries(limit=10000)
+        entries = await self.storage.get_all_memories(limit=10000)
         evicted = 0
         for entry in entries:
+            # 修复：usage_count 必须 >= EVICT_MIN_USAGE 才参与淘汰（>=3），避免冷启动惩罚
             if entry.usage_count >= self.EVICT_MIN_USAGE and entry.win_rate < self.EVICT_MAX_WIN_RATE:
                 if await self.storage.delete_entry(entry.id):
                     self._vectors.pop(entry.id, None)
