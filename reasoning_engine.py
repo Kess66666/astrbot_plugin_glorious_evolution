@@ -21,12 +21,10 @@ class ReasoningEngine:
         self.context = context
 
     def _get_provider(self, event: Optional[AstrMessageEvent] = None) -> Any:
-        """获取 LLM Provider（兼容 event=None 的后台调用场景）。"""
         if event is not None:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
             if provider:
                 return provider
-        # 降级：后台任务无 event 时使用默认 provider
         provider = self.context.get_using_provider()
         if not provider:
             providers = self.context.get_all_providers()
