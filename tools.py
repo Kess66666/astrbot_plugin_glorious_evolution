@@ -6,7 +6,7 @@
 - store_memory / search_memory / update_win_rate — 记忆 CRUD
 - evict_memories / get_evolution_stats / trigger_evolution — 进化操作
 - build_plan / judge_replan / build_replan — MIA 风格的 Plan-Judge-Replan 推理
-- run_agent_loop — 完整推理循环入口
+- run_agent_loop — 状态机驱动的混合 Agent 循环
 """
 
 import asyncio
@@ -20,6 +20,8 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.astr_agent_context import AstrAgentContext
 
+from .models import Action, Phase
+
 
 # ── 插件引用（由 main.py 注入） ──
 _plugin_cache: Optional["GloriousEvolutionPlugin"] = None
@@ -29,32 +31,12 @@ def _get_plugin() -> Optional["GloriousEvolutionPlugin"]:
     global _plugin_cache
     if _plugin_cache is not None:
         return _plugin_cache
-    try:
-        from astrbot.api.star import GlobalStarMap
-        star_map = GlobalStarMap()
-        from .main import GloriousEvolutionPlugin
-        for v in star_map.star_map.values():
-            if isinstance(v, GloriousEvolutionPlugin):
-                _plugin_cache = v
-                return v
-    except Exception:
-        pass
-    return None
+    raise RuntimeError("GloriousEvolutionPlugin not initialized")
 
 
-def inject_plugin(plugin: "GloriousEvolutionPlugin") -> None:
-    global _plugin_cache
-    _plugin_cache = plugin
-
-
-# ── 辅助：安全截断 ──
-def _trunc(s: str, n: int = 200) -> str:
-    return s if len(s) <= n else s[:n] + "..."
-
-
-# ═══════════════════════════════════════════
-# 记忆工具
-# ═══════════════════════════════════════════
+# ──────────────────────────────────────────
+# 记忆 CRUD 工具
+# ──────────────────────────────────────────
 
 @dataclass
 class StoreMemoryTool(FunctionTool[AstrAgentContext]):
@@ -96,19 +78,20 @@ class StoreMemoryTool(FunctionTool[AstrAgentContext]):
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
-            return "❌ Glorious Evolution plugin not ready"
-
-        question = str(kwargs.get("question", ""))
-        content = str(kwargs.get("content", ""))
-        memory_type = str(kwargs.get("memory_type", "declarative"))
-        category = str(kwargs.get("category", "general"))
-
-        eid = await plugin._memory_mgr.add_memory(
-            question=question, content=content,
-            memory_type=memory_type, category=category,
-        )
-        logger.info(f"[GE] Tool: store_memory → {eid}")
-        return f"✅ memory stored: {eid}"
+            return "❌ plugin not ready"
+        try:
+            question = str(kwargs.get("question", ""))
+            content = str(kwargs.get("content", ""))
+            memory_type = str(kwargs.get("memory_type", "procedural"))
+            category = str(kwargs.get("category", "general"))
+            entry = await plugin._memory_mgr.store_memory(
+                question=question, content=content,
+                memory_type=memory_type, category=category,
+            )
+            return f"✅ 记忆已存储: {entry.id} (type={entry.memory_type.value}, category={entry.category})"
+        except Exception as e:
+            logger.error(f"store_memory error: {e}")
+            return f"❌ 存储失败: {e}"
 
 
 @dataclass
@@ -141,23 +124,22 @@ class SearchMemoryTool(FunctionTool[AstrAgentContext]):
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
-
-        query = str(kwargs.get("query", ""))
-        top_k = int(kwargs.get("top_k", 5))
-        top_k = max(1, min(top_k, 10))
-
-        entries = await plugin._memory_mgr.retrieve_relevant_memories(
-            query=query, top_k=top_k,
-        )
-        if not entries:
-            return "🔍 no relevant memories found"
-
-        out = "🧠 relevant memories:\n"
-        for i, e in enumerate(entries[:top_k], 1):
-            out += f"{i}. [{e.id}] ({e.category}) win={e.win_rate:.0%} use={e.usage_count}\n"
-            out += f"   Q: {_trunc(e.question, 80)}\n"
-            out += f"   A: {_trunc(e.content, 120)}\n"
-        return out
+        try:
+            query = str(kwargs.get("query", ""))
+            top_k = int(kwargs.get("top_k", 5))
+            results = await plugin._memory_mgr.search_memories(query=query, top_k=min(top_k, 10))
+            if not results:
+                return "📭 未找到相关记忆"
+            lines = [f"## 🔍 检索结果 ({len(results)} 条) for: {query[:60]}\n"]
+            for i, mem in enumerate(results, 1):
+                lines.append(
+                    f"{i}. **[{mem.win_rate:.0%}]** ({mem.memory_type.value}) "
+                    f"{mem.content[:120]}..."
+                )
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"search_memory error: {e}")
+            return f"❌ 搜索失败: {e}"
 
 
 @dataclass
@@ -189,13 +171,19 @@ class UpdateWinRateTool(FunctionTool[AstrAgentContext]):
         plugin = _get_plugin()
         if not plugin or not plugin._memory_mgr:
             return "❌ plugin not ready"
+        try:
+            entry_id = str(kwargs.get("entry_id", ""))
+            success = bool(kwargs.get("success", False))
+            await plugin._memory_mgr.update_win_rate(entry_id=entry_id, success=success)
+            return f"✅ 胜率更新: {entry_id} → {'success' if success else 'failure'}"
+        except Exception as e:
+            logger.error(f"update_win_rate error: {e}")
+            return f"❌ 更新失败: {e}"
 
-        entry_id = str(kwargs.get("entry_id", ""))
-        success = bool(kwargs.get("success", True))
 
-        ok = await plugin._memory_mgr.update_win_rate(entry_id, success)
-        return f"📈 {entry_id} win_rate updated" if ok else f"❌ {entry_id} not found"
-
+# ──────────────────────────────────────────
+# 进化操作工具
+# ──────────────────────────────────────────
 
 @dataclass
 class EvictMemoriesTool(FunctionTool[AstrAgentContext]):
@@ -205,22 +193,18 @@ class EvictMemoriesTool(FunctionTool[AstrAgentContext]):
         "Removes entries with low usage count AND low win_rate. "
         "Call this periodically to keep the memory bank clean and efficient."
     )
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        }
-    )
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         plugin = _get_plugin()
-        if not plugin or not plugin._memory_mgr:
+        if not plugin or not plugin._evo_engine:
             return "❌ plugin not ready"
-
-        n = await plugin._memory_mgr.evict_low_quality()
-        plugin.evo_stats.increment("total_evictions", n)
-        return f"🧹 evicted {n} low-quality memories" if n else "🧹 nothing to evict"
+        try:
+            count = await plugin._evo_engine.evict_memories()
+            return f"🧹 清理完成: 驱逐了 {count} 条低质量记忆"
+        except Exception as e:
+            logger.error(f"evict_memories error: {e}")
+            return f"❌ 清理失败: {e}"
 
 
 @dataclass
@@ -228,69 +212,56 @@ class GetEvolutionStatsTool(FunctionTool[AstrAgentContext]):
     name: str = "get_evolution_stats"
     description: str = (
         "Get statistics about the Glorious Evolution system: "
-        "total memories, win rates, vector index status, evolution cycle count, "
-        "and insights generated. Use this to understand the system's current knowledge state."
+        "total memories, win rates, vector index status, evolution cycle count, and insights generated. "
+        "Use this to understand the system's current knowledge state."
     )
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        }
-    )
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         plugin = _get_plugin()
-        if not plugin or not plugin._memory_mgr:
+        if not plugin or not plugin._evo_engine:
             return "❌ plugin not ready"
-
-        stats = plugin.evo_stats.get_summary()
-        mgr_stats = await plugin._memory_mgr.get_stats()
-
-        return (
-            f"📊 evolution stats:\n"
-            f"📚 memories: {mgr_stats['total_memories']} | 🧬 vectors: {mgr_stats['vector_index_size']}"
-            f" {'✅' if mgr_stats.get('embedding_ready') else '⚠️'}\n"
-            f"🔄 evolutions: {stats['total_evolutions']} | 💡 insights: {stats['total_insights']}"
-            f" | 🗑️ evicted: {stats['total_evictions']}\n"
-            f"⏱️ last: {stats.get('last_evolution_at', 'N/A')}"
-            f" ({stats.get('last_evolution_duration_sec', 'N/A')}s)\n"
-            f"💾 data: {plugin.DATA_DIR}"
-        )
+        try:
+            stats = await plugin._evo_engine.get_stats()
+            return (
+                f"## 📊 光荣进化统计\n"
+                f"- 总记忆: {stats.get('total_memories', 0)}\n"
+                f"- 进化周期: {stats.get('evolution_cycles', 0)}\n"
+                f"- 平均胜率: {stats.get('avg_win_rate', 0):.1%}\n"
+                f"- 正面记忆: {stats.get('positive_count', 0)}\n"
+                f"- 负面记忆: {stats.get('negative_count', 0)}\n"
+                f"- 向量索引: {'✅ ready' if stats.get('vector_ready', False) else '⚠️ not ready'}"
+            )
+        except Exception as e:
+            logger.error(f"get_evolution_stats error: {e}")
+            return f"❌ 获取统计失败: {e}"
 
 
 @dataclass
 class TriggerEvolutionTool(FunctionTool[AstrAgentContext]):
     name: str = "trigger_evolution"
     description: str = (
-        "Manually trigger a full evolution cycle: consolidate episodic memories into "
-        "declarative rules, generate insights from win_rate patterns, and evict low-quality "
-        "memories. The system auto-runs this every 6 hours, but you can call it on-demand "
-        "after storing many new memories."
+        "Manually trigger a full evolution cycle: consolidate episodic memories "
+        "into declarative rules, generate insights from win_rate patterns, and evict "
+        "low-quality memories. The system auto-runs this every 6 hours, but you can "
+        "call it on-demand after storing many new memories."
     )
-    parameters: dict = Field(
-        default_factory=lambda: {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        }
-    )
+    parameters: dict = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
     async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
         plugin = _get_plugin()
-        if not plugin:
+        if not plugin or not plugin._evo_engine:
             return "❌ plugin not ready"
-
         try:
-            await asyncio.wait_for(plugin._run_evolution(), timeout=120)
-            asyncio.create_task(plugin._backup_all(label="manual"))
-            return "🧬 evolution cycle complete ✅"
-        except asyncio.TimeoutError:
-            return "⚠️ evolution timeout (2min)"
+            result = await plugin._evo_engine.run_evolution_cycle()
+            return f"🧬 进化周期完成: {result}"
+        except Exception as e:
+            logger.error(f"trigger_evolution error: {e}")
+            return f"❌ 进化失败: {e}"
 
 
 # ═══════════════════════════════════════════
-# 推理工具 (Plan-Judge-Replan)
+# MIA Plan-Judge-Replan 推理工具（原子操作用）
 # ═══════════════════════════════════════════
 
 @dataclass
@@ -300,21 +271,14 @@ class BuildPlanTool(FunctionTool[AstrAgentContext]):
         "【MIA Phase 2】Build an action plan for a given goal using past experience. "
         "Retrieves relevant positive (high win_rate) and negative (low win_rate) memories, "
         "then uses LLM reasoning to generate a structured step-by-step plan. "
-        "ALWAYS call this BEFORE attempting complex tasks like debugging, deployment, "
-        "code changes, or configuration updates."
+        "ALWAYS call this BEFORE attempting complex tasks like debugging, deployment, code changes, or configuration updates."
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The goal or problem to plan for.",
-                },
-                "extra_context": {
-                    "type": "string",
-                    "description": "Additional context: error logs, current state, constraints.",
-                },
+                "question": {"type": "string", "description": "The goal or problem to plan for."},
+                "extra_context": {"type": "string", "description": "Additional context: error logs, current state, constraints."},
             },
             "required": ["question"],
         }
@@ -324,19 +288,16 @@ class BuildPlanTool(FunctionTool[AstrAgentContext]):
         plugin = _get_plugin()
         if not plugin or not plugin._reasoning_engine:
             return "❌ plugin not ready"
-
         question = str(kwargs.get("question", ""))
         extra_context = str(kwargs.get("extra_context", ""))
-
         try:
             plan_text, pos, neg = await plugin._reasoning_engine.build_plan(
                 event=None, question=question, extra_context=extra_context,
             )
         except RuntimeError as e:
-            return f"❌ LLM plan failed: {e}"
-
+            return f"❌ LLM planning failed: {e}"
         return (
-            f"## 🎯 Goal\n{question}\n\n## 📋 Plan\n{plan_text}\n\n"
+            f"## 📋 Plan for: {question[:80]}\n\n{plan_text}\n\n"
             f"📊 Retrieved: {len(pos)} positive + {len(neg)} negative memories\n"
             f"💡 Next: execute the plan, then call `judge_replan` with the execution trace."
         )
@@ -368,23 +329,18 @@ class JudgeReplanTool(FunctionTool[AstrAgentContext]):
         plugin = _get_plugin()
         if not plugin or not plugin._reasoning_engine:
             return "❌ plugin not ready"
-
         execution_trace = str(kwargs.get("execution_trace", ""))
-
-        # 优先 LLM 判断
         try:
             result = await plugin._reasoning_engine.judge_replan(
                 event=None, execution_trace=execution_trace,
             )
-            if result == "yes":
-                return "🔄 replan suggested — call `build_replan` with the original goal and this trace."
-            else:
-                return "✅ no replan needed — plan succeeded."
         except RuntimeError:
-            # 降级：关键词匹配
-            failure_keywords = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]
-            has_failure = any(kw in execution_trace.lower() for kw in failure_keywords)
-            return "🔄 replan suggested" if has_failure else "✅ no replan needed"
+            failure_kw = ["error", "failed", "❌", "exception", "timeout"]
+            result = "yes" if any(k in execution_trace.lower() for k in failure_kw) else "no"
+        if result == "yes":
+            return "🔄 replan suggested — call `build_replan` with the original goal and this trace."
+        else:
+            return "✅ plan succeeded — no replan needed."
 
 
 @dataclass
@@ -400,14 +356,8 @@ class BuildReplanTool(FunctionTool[AstrAgentContext]):
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The original goal.",
-                },
-                "execution_trace": {
-                    "type": "string",
-                    "description": "The execution trace that led to failure.",
-                },
+                "question": {"type": "string", "description": "The original goal."},
+                "execution_trace": {"type": "string", "description": "The execution trace that led to failure."},
             },
             "required": ["question", "execution_trace"],
         }
@@ -417,17 +367,14 @@ class BuildReplanTool(FunctionTool[AstrAgentContext]):
         plugin = _get_plugin()
         if not plugin or not plugin._reasoning_engine:
             return "❌ plugin not ready"
-
         question = str(kwargs.get("question", ""))
         execution_trace = str(kwargs.get("execution_trace", ""))
-
         try:
             replan = await plugin._reasoning_engine.build_replan(
                 event=None, question=question, execution_trace=execution_trace,
             )
         except RuntimeError as e:
-            return f"❌ LLM replan failed: {e}"
-
+            return f"❌ Replanning failed: {e}"
         return (
             f"## 🔄 Revised Plan\n\n{replan}\n\n"
             f"💡 Next: execute the revised plan, then call `judge_replan` again."
@@ -435,20 +382,31 @@ class BuildReplanTool(FunctionTool[AstrAgentContext]):
 
 
 # ═══════════════════════════════════════════
-# Agent Loop (完整推理循环)
+# Agent Loop — 状态机驱动的混合循环
 # ═══════════════════════════════════════════
 
 @dataclass
 class RunAgentLoopTool(FunctionTool[AstrAgentContext]):
+    """
+    状态机驱动的混合 Agent 循环。
+
+    核心变化 (v2):
+    - 状态机控制 phase 转换，LLM 只在 planning/judging 阶段做策略补充
+    - 固定 Action 枚举：BUILD_PLAN → EXECUTE_PLAN → JUDGE_RESULT → (BUILD_REPLAN | FINISH)
+    - 每次调用推进到下一个 EXECUTE 暂停点，等待调用方执行后继续
+    - 支持 mode="background" 自主运行
+    """
     name: str = "run_agent_loop"
     description: str = (
-        "【MIA Full Cycle】Run the complete Plan-Judge-Replan reasoning loop. "
-        "Usage pattern:\n"
-        "1. First call: `run_agent_loop(goal='your goal')` → returns a plan\n"
-        "2. Execute the plan steps\n"
-        "3. Second call: `run_agent_loop(goal='your goal', execution_trace='what happened')` → judges & replans if needed\n"
-        "4. Repeat until 'no replan needed'\n"
-        "This tool combines build_plan + judge_replan + build_replan in one interface."
+        "【State-Driven Agent Loop】状态机驱动的混合推理循环。\n"
+        "Usage (manual mode):\n"
+        "1. `run_agent_loop(goal='...')` → 返回计划，等待你执行\n"
+        "2. 执行步骤后 → `run_agent_loop(goal='...', execution_trace='...')` → 评判 + (重规划 | 完成)\n"
+        "3. 重复直到完成\n"
+        "Usage (background mode):\n"
+        "`run_agent_loop(goal='...', mode='background')` → 后台自主运行，不返回中间结果\n\n"
+        "Fixed Action flow: BUILD_PLAN → EXECUTE_PLAN → JUDGE_RESULT → (BUILD_REPLAN → EXECUTE_REPLAN → JUDGE_RESULT | FINISH)\n"
+        "State machine controls the flow; LLM only assists with planning & judging."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -460,11 +418,16 @@ class RunAgentLoopTool(FunctionTool[AstrAgentContext]):
                 },
                 "execution_trace": {
                     "type": "string",
-                    "description": "Previous execution trace. Omit for the initial plan. Include to get replanning.",
+                    "description": "Previous execution trace. Omit for the initial call. Include after executing the returned plan.",
                 },
                 "max_iterations": {
                     "type": "integer",
-                    "description": "Maximum plan-replan iterations (default 3). Used for loop control.",
+                    "description": "Maximum plan-replan iterations (default 3).",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["manual", "background"],
+                    "description": "manual: pause at execution phases (default). background: run full loop autonomously.",
                 },
             },
             "required": ["goal"],
@@ -478,46 +441,51 @@ class RunAgentLoopTool(FunctionTool[AstrAgentContext]):
 
         goal = str(kwargs.get("goal", ""))
         execution_trace = str(kwargs.get("execution_trace", ""))
-        engine = plugin._reasoning_engine
+        max_iterations = int(kwargs.get("max_iterations", 3))
+        mode = str(kwargs.get("mode", "manual"))
 
-        if not execution_trace:
-            # Phase 1: 初始计划
-            try:
-                plan_text, pos, neg = await engine.build_plan(
-                    event=None, question=goal, extra_context="",
-                )
-            except RuntimeError as e:
-                return f"❌ LLM planning failed: {e}"
+        agent_loop = plugin._agent_loop
+        if agent_loop is None:
+            return "❌ AgentLoop not initialized"
 
-            return (
-                f"## 🎯 Goal\n{goal}\n\n## 📋 Initial Plan\n{plan_text}\n\n"
-                f"📊 Retrieved: {len(pos)} positive + {len(neg)} negative memories\n"
-                f"💡 **Next**: Execute the plan, then call `run_agent_loop` again "
-                f"with `execution_trace` set to what happened."
-            )
+        if mode == "background":
+            return await self._run_background(plugin, goal, max_iterations)
 
-        # Phase 2: 判断 + (可能) 重新规划
+        # 工具模式：状态机推进
         try:
-            need_replan = await engine.judge_replan(
-                event=None, execution_trace=execution_trace,
+            result = await agent_loop.process(
+                goal=goal,
+                execution_trace=execution_trace,
+                max_iterations=max_iterations,
             )
-        except RuntimeError:
-            # 降级关键词判断
-            failure_keywords = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]
-            need_replan = "yes" if any(kw in execution_trace.lower() for kw in failure_keywords) else "no"
+            return result
+        except Exception as e:
+            logger.error(f"[RunAgentLoopTool] error: {e}")
+            return f"❌ AgentLoop 异常: {e}"
 
-        if need_replan == "yes":
+    async def _run_background(self, plugin, goal: str, max_iterations: int) -> str:
+        """后台模式：启动异步循环，立即返回状态。"""
+        agent_loop = plugin._agent_loop
+        if plugin._agent_loop_task and not plugin._agent_loop_task.done():
+            return "⚠️ 已有后台循环在运行，请等待完成"
+
+        plugin._agent_loop_task = asyncio.create_task(
+            agent_loop.run_in_background(goal=goal, max_iterations=max_iterations)
+        )
+
+        def _on_done(t):
             try:
-                replan = await engine.build_replan(
-                    event=None, question=goal, execution_trace=execution_trace,
-                )
-            except RuntimeError as e:
-                return f"⚠️ Replanning LLM failed, using fallback.\n❌ {e}"
+                state = t.result()
+                logger.info(f"[RunAgentLoopTool] 后台循环完成: phase={state.phase.value}")
+            except Exception as e:
+                logger.error(f"[RunAgentLoopTool] 后台循环异常: {e}")
 
-            return (
-                f"## 🔄 Plan Revision Needed\n\n{replan}\n\n"
-                f"💡 **Next**: Execute the revised plan, then call `run_agent_loop` again "
-                f"with the updated execution trace."
-            )
-        else:
-            return f"## ✅ Goal Achieved\n\n{goal}\n\nPlan executed successfully — no replan needed."
+        plugin._agent_loop_task.add_done_callback(_on_done)
+
+        return (
+            f"🚀 **后台循环已启动**\n\n"
+            f"🎯 目标: {goal[:100]}\n"
+            f"🔄 最大迭代: {max_iterations}\n"
+            f"📌 状态: Phase={Phase.INIT.value}\n\n"
+            f"💡 循环将自动运行 plan→judge→replan，完成后可查询结果。"
+        )

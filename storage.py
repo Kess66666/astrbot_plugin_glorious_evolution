@@ -18,162 +18,159 @@ from .models import MemoryEntry, MemoryType, Judgement
 class Storage:
     """
     SQLite 存储层，支持 FTS5 全文搜索。
-    使用 asyncio.Lock 防死锁（避免阻塞事件循环线程）。
+
+    线程安全：所有写操作通过 _lock 串行化。
     """
 
-    def __init__(self, data_dir: str) -> None:
-        self.db_path = os.path.join(data_dir, "evolution.db")
+    def __init__(self, db_path: str):
+        self.db_path = db_path
         self._lock = asyncio.Lock()
         self._init_db()
 
     def _init_db(self) -> None:
-        """初始化数据库表结构（单线程启动阶段，无需锁）"""
+        """初始化数据库表（若不存在）。"""
         conn = sqlite3.connect(self.db_path)
         try:
-            conn.execute("""
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id TEXT PRIMARY KEY,
-                    memory_type TEXT NOT NULL DEFAULT 'procedural',
+                    question TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    memory_type TEXT NOT NULL DEFAULT 'declarative',
                     category TEXT NOT NULL DEFAULT 'general',
-                    question TEXT NOT NULL DEFAULT '',
-                    content TEXT NOT NULL DEFAULT '',
-                    trajectory TEXT NOT NULL DEFAULT '',
-                    rules TEXT NOT NULL DEFAULT '',
                     judgement TEXT NOT NULL DEFAULT 'pending',
+                    win_rate REAL NOT NULL DEFAULT 0.5,
                     usage_count INTEGER NOT NULL DEFAULT 0,
-                    success_count INTEGER NOT NULL DEFAULT 0,
-                    win_rate REAL NOT NULL DEFAULT 0.0,
-                    embedding TEXT,
-                    tags TEXT NOT NULL DEFAULT '[]',
-                    related_ids TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                )
-            """)
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            # FTS5 虚拟表（content=memories 外部内容模式）
-            conn.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-                USING fts5(
-                    question, content, category,
-                    content='memories',
-                    content_rowid='rowid'
-                )
-            """)
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    question, content, content=memories, content_rowid=rowid
+                );
 
-            # FTS 同步触发器
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories
-                BEGIN
-                    INSERT INTO memories_fts(rowid, question, content, category)
-                    VALUES (new.rowid, new.question, new.content, new.category);
-                END
-            """)
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories
-                BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, question, content, category)
-                    VALUES ('delete', old.rowid, old.question, old.content, old.category);
-                END
-            """)
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
-                BEGIN
-                    INSERT INTO memories_fts(memories_fts, rowid, question, content, category)
-                    VALUES ('delete', old.rowid, old.question, old.content, old.category);
-                    INSERT INTO memories_fts(rowid, question, content, category)
-                    VALUES (new.rowid, new.question, new.content, new.category);
-                END
-            """)
+                -- 触发器保持 FTS 索引同步
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, question, content)
+                    VALUES (new.rowid, new.question, new.content);
+                END;
 
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, question, content)
+                    VALUES ('delete', old.rowid, old.question, old.content);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, question, content)
+                    VALUES ('delete', old.rowid, old.question, old.content);
+                    INSERT INTO memories_fts(rowid, question, content)
+                    VALUES (new.rowid, new.question, new.content);
+                END;
+            """)
             conn.commit()
         finally:
             conn.close()
 
-    async def add_entry(self, entry: MemoryEntry) -> str:
-        """添加一条记忆，返回 entry_id"""
+    async def insert_entry(self, entry: MemoryEntry) -> bool:
+        """插入一条记忆（id 冲突时跳过）。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                d = entry.to_db_dict()
                 conn.execute(
-                    """INSERT INTO memories
-                       (id, memory_type, category, question, content,
-                        trajectory, rules, judgement, usage_count, success_count,
-                        win_rate, embedding, tags, related_ids, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT OR IGNORE INTO memories
+                       (id, question, content, memory_type, category, judgement,
+                        win_rate, usage_count, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        d["id"], d["memory_type"], d["category"], d["question"],
-                        d["content"], d["trajectory"], d["rules"], d["judgement"],
-                        d["usage_count"], d["success_count"], d["win_rate"],
-                        d["embedding"], d["tags"], d["related_ids"],
-                        d["created_at"], d["updated_at"],
+                        entry.id,
+                        entry.question,
+                        entry.content,
+                        entry.memory_type.value,
+                        entry.category,
+                        entry.judgement.value,
+                        entry.win_rate,
+                        entry.usage_count,
+                        entry.created_at,
+                        entry.updated_at,
                     ),
                 )
                 conn.commit()
-                return entry.id
+                return conn.total_changes > 0
             finally:
                 conn.close()
 
-    async def get_entry(self, entry_id: str) -> Optional[MemoryEntry]:
-        """根据 ID 获取单条记忆"""
+    async def update_win_rate(self, entry_id: str, success: bool) -> bool:
+        """更新胜率。返回 True 表示更新成功。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute(
-                    "SELECT * FROM memories WHERE id = ?", (entry_id,)
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    return None
-                return MemoryEntry.from_db_row(dict(row))
+                now = datetime.now().isoformat()
+                if success:
+                    conn.execute(
+                        """UPDATE memories
+                           SET win_rate = MIN(1.0, win_rate + 0.05),
+                               usage_count = usage_count + 1,
+                               updated_at = ?
+                           WHERE id = ?""",
+                        (now, entry_id),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE memories
+                           SET win_rate = MAX(0.0, win_rate - 0.1),
+                               usage_count = usage_count + 1,
+                               updated_at = ?
+                           WHERE id = ?""",
+                        (now, entry_id),
+                    )
+                conn.commit()
+                return conn.total_changes > 0
             finally:
                 conn.close()
 
-    async def update_entry(self, entry_id: str, **kwargs: Any) -> bool:
-        """更新记忆的指定字段"""
-        if not kwargs:
-            return False
-
+    async def update_judgement(self, entry_id: str, judgement: Judgement) -> bool:
+        """更新评判状态。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                sets = ", ".join(f"{k} = ?" for k in kwargs)
-                values = list(kwargs.values()) + [entry_id]
-                cursor = conn.execute(
-                    f"UPDATE memories SET {sets} WHERE id = ?", values
+                conn.execute(
+                    "UPDATE memories SET judgement = ?, updated_at = ? WHERE id = ?",
+                    (judgement.value, datetime.now().isoformat(), entry_id),
                 )
                 conn.commit()
-                return cursor.rowcount > 0
+                return conn.total_changes > 0
             finally:
                 conn.close()
 
     async def delete_entry(self, entry_id: str) -> bool:
-        """删除一条记忆"""
+        """删除一条记忆。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
-                cursor = conn.execute(
-                    "DELETE FROM memories WHERE id = ?", (entry_id,)
-                )
+                conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
                 conn.commit()
-                return cursor.rowcount > 0
+                return conn.total_changes > 0
             finally:
                 conn.close()
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
-        """净化 FTS5 查询，防止特殊字符触发语法解析错误。
-
-        FTS5 特殊字符：* " ( ) + -
-        此外 . 等标点在未引号包裹时也可能导致 tokenizer 抛错。
-        策略：去除已有双引号后，整体用双引号包裹为 phrase query。
-        """
-        # 去掉用户输入中可能存在的双引号，避免破坏 phrase 语法
-        query = query.replace('"', '')
-        # 整体包裹为 phrase query，FTS5 内部仍会按 tokenizer 分词匹配
-        return f'"{query}"'
+        """净化 FTS5 查询字符串，避免特殊字符触发语法错误。"""
+        # 去掉 FTS5 的保留字符，用空格替换
+        import re
+        safe = re.sub(r'[^\w\u4e00-\u9fff]', ' ', query)
+        # 避免空查询
+        if not safe.strip():
+            return '""'
+        # 分词后用 OR 连接
+        terms = safe.split()
+        if not terms:
+            return '""'
+        return " OR ".join(terms)
 
     async def search_entries(
         self,
@@ -233,6 +230,37 @@ class Storage:
                 )
                 rows = cursor.fetchall()
                 return [MemoryEntry.from_db_row(dict(r)) for r in rows]
+            finally:
+                conn.close()
+
+    async def get_entries_by_ids(self, entry_ids: List[str]) -> Dict[str, MemoryEntry]:
+        """按 ID 列表批量获取记忆条目，返回 {id: MemoryEntry} 映射。
+
+        用于向量检索后的精排阶段——从候选 ID 批量加载完整条目。
+        自动按 500 分批，控制 IN 子句大小。
+        """
+        if not entry_ids:
+            return {}
+
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                result: Dict[str, MemoryEntry] = {}
+
+                chunk_size = 500
+                for i in range(0, len(entry_ids), chunk_size):
+                    chunk = entry_ids[i:i + chunk_size]
+                    placeholders = ",".join("?" * len(chunk))
+                    cursor = conn.execute(
+                        f"SELECT * FROM memories WHERE id IN ({placeholders})",
+                        chunk,
+                    )
+                    for row in cursor:
+                        entry = MemoryEntry.from_db_row(dict(row))
+                        result[entry.id] = entry
+
+                return result
             finally:
                 conn.close()
 

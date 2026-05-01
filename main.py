@@ -34,6 +34,7 @@ from .tools import (
     EvictMemoriesTool, GetEvolutionStatsTool, TriggerEvolutionTool,
     BuildPlanTool, JudgeReplanTool, BuildReplanTool, RunAgentLoopTool,
 )
+from .agent_loop import AgentLoop
 
 CST = timezone(timedelta(hours=8))
 
@@ -92,7 +93,29 @@ async def _auto_backup(source_path: str, label: str) -> Optional[str]:
     await asyncio.get_event_loop().run_in_executor(None, shutil.copy2, source_path, dest)
     size_kb = os.path.getsize(dest) / 1024
     logger.info(f"[GE] backup: {os.path.basename(dest)} ({size_kb:.0f} KB)")
+    # 轮转清理：每类文件只保留最近 5 份
+    await _auto_rotate_backups(source_path)
     return dest
+
+
+async def _auto_rotate_backups(source_path: str, keep: int = 5) -> None:
+    """轮转清理：对同一 base name 的备份文件，只保留最近 `keep` 份。"""
+    fname = os.path.basename(source_path)
+    base, _ = os.path.splitext(fname)
+    prefix = f"{base}_"
+
+    def _clean():
+        candidates = []
+        for entry in os.scandir(BACKUP_DIR):
+            if entry.is_file() and entry.name.startswith(prefix):
+                candidates.append((entry.path, os.path.getmtime(entry.path)))
+        # 按修改时间降序排序，保留前 keep 个
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        for path, _ in candidates[keep:]:
+            os.remove(path)
+            logger.debug(f"[GE] rotated out: {os.path.basename(path)}")
+
+    await asyncio.get_event_loop().run_in_executor(None, _clean)
 
 
 async def _backup_all(label: str = "evo") -> None:
@@ -364,12 +387,15 @@ class GloriousEvolutionPlugin(Star):
         self._classify_task: Optional[asyncio.Task] = None
         self._evo_task: Optional[asyncio.Task] = None
         self._health_check_task: Optional[asyncio.Task] = None
+        self._agent_loop_task: Optional[asyncio.Task] = None
+        self._agent_loop: Optional[AgentLoop] = None
         self._classifier_llm = None
 
         self._storage = Storage(DATA_DIR)
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
+        self._agent_loop = AgentLoop(self._reasoning_engine)
 
         global _plugin_cache
         _plugin_cache = self
