@@ -1,6 +1,9 @@
 """
 光荣进化系统 - 数据模型
-MIA 风格的记忆条目定义
+MIA 风格的记忆条目定义 + Agent Loop 状态机
+
+v1.0.11 修复:
+- 删除 MemoryEntry.update_win_rate()，胜率统一由 MemoryManager.update_win_rate() 管理
 """
 
 import json
@@ -9,6 +12,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+
+# ── 记忆数据模型 ──
 
 class MemoryType(str, Enum):
     """记忆类型 — MIA 蓝图"""
@@ -26,9 +31,7 @@ class Judgement(str, Enum):
 
 @dataclass
 class MemoryEntry:
-    """
-    MIA 风格的记忆条目。
-    """
+    """MIA 风格的记忆条目。"""
     id: str = ""
     memory_type: MemoryType = MemoryType.PROCEDURAL
     category: str = "general"
@@ -49,16 +52,6 @@ class MemoryEntry:
     def __post_init__(self) -> None:
         if not self.id:
             self.id = f"MEM-{id(self) % 1000:03d}"
-
-    def update_win_rate(self, success: bool, decay_factor: float = 0.95) -> None:
-        self.usage_count += 1
-        if success:
-            self.success_count += 1
-        self.win_rate = (
-            decay_factor * self.win_rate
-            + (1 - decay_factor) * (self.success_count / self.usage_count)
-        )
-        self.updated_at = datetime.now().isoformat()
 
     def to_db_dict(self) -> Dict[str, Any]:
         embedding_str = None
@@ -125,4 +118,69 @@ class MemoryEntry:
             related_ids=related_ids,
             created_at=row.get("created_at", ""),
             updated_at=row.get("updated_at", ""),
+        )
+
+
+# ── Agent Loop 状态机 ──
+
+class Phase(str, Enum):
+    """Agent Loop 的固定阶段"""
+    BUILD_PLAN = "BUILD_PLAN"
+    EXECUTING = "EXECUTING"
+    JUDGING = "JUDGING"
+    REPLANNING = "REPLANNING"
+    EXECUTING_REPLAN = "EXECUTING_REPLAN"
+    DONE = "DONE"
+    FAILED = "FAILED"
+
+
+class Action(str, Enum):
+    """Agent Loop 可执行的动作"""
+    BUILD_PLAN = "BUILD_PLAN"
+    EXECUTE_PLAN = "EXECUTE_PLAN"
+    JUDGE_RESULT = "JUDGE_RESULT"
+    BUILD_REPLAN = "BUILD_REPLAN"
+    EXECUTE_REPLAN = "EXECUTE_REPLAN"
+    FINISH = "FINISH"
+
+
+PHASE_TRANSITIONS = {
+    Phase.BUILD_PLAN: Phase.EXECUTING,
+    Phase.EXECUTING: Phase.JUDGING,
+    Phase.REPLANNING: Phase.EXECUTING_REPLAN,
+    Phase.EXECUTING_REPLAN: Phase.JUDGING,
+}
+
+PHASE_TO_ACTION = {
+    Phase.BUILD_PLAN: Action.BUILD_PLAN,
+    Phase.EXECUTING: Action.EXECUTE_PLAN,
+    Phase.JUDGING: Action.JUDGE_RESULT,
+    Phase.REPLANNING: Action.BUILD_REPLAN,
+    Phase.EXECUTING_REPLAN: Action.EXECUTE_REPLAN,
+    Phase.DONE: Action.FINISH,
+    Phase.FAILED: Action.FINISH,
+}
+
+
+@dataclass
+class AgentLoopState:
+    """Agent Loop 当前状态"""
+    goal: str = ""
+    max_iterations: int = 3
+    iteration: int = 0
+    phase: Phase = Phase.BUILD_PLAN
+    action: Action = Action.BUILD_PLAN
+    plan: str = ""
+    execution_trace: str = ""
+    result: str = ""
+    error: str = ""
+    done: bool = False
+
+    def to_display(self) -> str:
+        return (
+            f"Goal: {self.goal}\n"
+            f"Iteration: {self.iteration}/{self.max_iterations}\n"
+            f"Phase: {self.phase.value}\n"
+            f"Action: {self.action.value}\n"
+            f"Done: {self.done}"
         )
