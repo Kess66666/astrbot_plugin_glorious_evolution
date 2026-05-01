@@ -3,10 +3,10 @@
 SQLite + FTS5 全文搜索 + 向量存储
 """
 
+import asyncio
 import json
 import os
 import sqlite3
-import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -18,82 +18,81 @@ from .models import MemoryEntry, MemoryType, Judgement
 class Storage:
     """
     SQLite 存储层，支持 FTS5 全文搜索。
-    线程安全：每个操作通过 threading.Lock 串行化。
+    使用 asyncio.Lock 防死锁（避免阻塞事件循环线程）。
     """
 
     def __init__(self, data_dir: str) -> None:
         self.db_path = os.path.join(data_dir, "evolution.db")
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
         self._init_db()
 
     def _init_db(self) -> None:
-        """初始化数据库表结构"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS memories (
-                        id TEXT PRIMARY KEY,
-                        memory_type TEXT NOT NULL DEFAULT 'procedural',
-                        category TEXT NOT NULL DEFAULT 'general',
-                        question TEXT NOT NULL DEFAULT '',
-                        content TEXT NOT NULL DEFAULT '',
-                        trajectory TEXT NOT NULL DEFAULT '',
-                        rules TEXT NOT NULL DEFAULT '',
-                        judgement TEXT NOT NULL DEFAULT 'pending',
-                        usage_count INTEGER NOT NULL DEFAULT 0,
-                        success_count INTEGER NOT NULL DEFAULT 0,
-                        win_rate REAL NOT NULL DEFAULT 0.0,
-                        embedding TEXT,
-                        tags TEXT NOT NULL DEFAULT '[]',
-                        related_ids TEXT NOT NULL DEFAULT '[]',
-                        created_at TEXT NOT NULL DEFAULT '',
-                        updated_at TEXT NOT NULL DEFAULT ''
-                    )
-                """)
+        """初始化数据库表结构（单线程启动阶段，无需锁）"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    memory_type TEXT NOT NULL DEFAULT 'procedural',
+                    category TEXT NOT NULL DEFAULT 'general',
+                    question TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL DEFAULT '',
+                    trajectory TEXT NOT NULL DEFAULT '',
+                    rules TEXT NOT NULL DEFAULT '',
+                    judgement TEXT NOT NULL DEFAULT 'pending',
+                    usage_count INTEGER NOT NULL DEFAULT 0,
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    win_rate REAL NOT NULL DEFAULT 0.0,
+                    embedding TEXT,
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    related_ids TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+            """)
 
-                # FTS5 虚拟表（content=memories 外部内容模式）
-                conn.execute("""
-                    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-                    USING fts5(
-                        question, content, category,
-                        content='memories',
-                        content_rowid='rowid'
-                    )
-                """)
+            # FTS5 虚拟表（content=memories 外部内容模式）
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(
+                    question, content, category,
+                    content='memories',
+                    content_rowid='rowid'
+                )
+            """)
 
-                # FTS 同步触发器
-                conn.execute("""
-                    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories
-                    BEGIN
-                        INSERT INTO memories_fts(rowid, question, content, category)
-                        VALUES (new.rowid, new.question, new.content, new.category);
-                    END
-                """)
-                conn.execute("""
-                    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories
-                    BEGIN
-                        INSERT INTO memories_fts(memories_fts, rowid, question, content, category)
-                        VALUES ('delete', old.rowid, old.question, old.content, old.category);
-                    END
-                """)
-                conn.execute("""
-                    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
-                    BEGIN
-                        INSERT INTO memories_fts(memories_fts, rowid, question, content, category)
-                        VALUES ('delete', old.rowid, old.question, old.content, old.category);
-                        INSERT INTO memories_fts(rowid, question, content, category)
-                        VALUES (new.rowid, new.question, new.content, new.category);
-                    END
-                """)
+            # FTS 同步触发器
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories
+                BEGIN
+                    INSERT INTO memories_fts(rowid, question, content, category)
+                    VALUES (new.rowid, new.question, new.content, new.category);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories
+                BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, question, content, category)
+                    VALUES ('delete', old.rowid, old.question, old.content, old.category);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories
+                BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, question, content, category)
+                    VALUES ('delete', old.rowid, old.question, old.content, old.category);
+                    INSERT INTO memories_fts(rowid, question, content, category)
+                    VALUES (new.rowid, new.question, new.content, new.category);
+                END
+            """)
 
-                conn.commit()
-            finally:
-                conn.close()
+            conn.commit()
+        finally:
+            conn.close()
 
     async def add_entry(self, entry: MemoryEntry) -> str:
         """添加一条记忆，返回 entry_id"""
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 d = entry.to_db_dict()
@@ -118,7 +117,7 @@ class Storage:
 
     async def get_entry(self, entry_id: str) -> Optional[MemoryEntry]:
         """根据 ID 获取单条记忆"""
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
@@ -137,7 +136,7 @@ class Storage:
         if not kwargs:
             return False
 
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 sets = ", ".join(f"{k} = ?" for k in kwargs)
@@ -152,7 +151,7 @@ class Storage:
 
     async def delete_entry(self, entry_id: str) -> bool:
         """删除一条记忆"""
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 cursor = conn.execute(
@@ -184,7 +183,7 @@ class Storage:
         min_win_rate: float = 0.0,
     ) -> List[MemoryEntry]:
         """FTS5 全文搜索 + 过滤"""
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
@@ -224,7 +223,7 @@ class Storage:
 
     async def get_all_entries(self, limit: int = 1000) -> List[MemoryEntry]:
         """获取所有记忆条目"""
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
@@ -239,7 +238,7 @@ class Storage:
 
     async def get_statistics(self) -> Dict[str, Any]:
         """获取统计快照"""
-        with self._lock:
+        async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row

@@ -3,7 +3,7 @@
 MIA 风格的 Plan-Judge-Replan 循环（Phase 2）
 """
 
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
 from astrbot.api import logger
 from astrbot.api.star import Context
@@ -20,11 +20,25 @@ class ReasoningEngine:
         self.memory_mgr = memory_mgr
         self.context = context
 
-    async def _call_llm(self, event: AstrMessageEvent, system_prompt: str,
-                        user_prompt: str, temperature: float = 0.0) -> str:
-        provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+    def _get_provider(self, event: Optional[AstrMessageEvent] = None) -> Any:
+        """获取 LLM Provider（兼容 event=None 的后台调用场景）。"""
+        if event is not None:
+            provider = self.context.get_using_provider(umo=event.unified_msg_origin)
+            if provider:
+                return provider
+        # 降级：后台任务无 event 时使用默认 provider
+        provider = self.context.get_using_provider()
+        if not provider:
+            providers = self.context.get_all_providers()
+            if providers:
+                provider = providers[0]
         if not provider:
             raise RuntimeError("No LLM provider available")
+        return provider
+
+    async def _call_llm(self, event: Optional[AstrMessageEvent], system_prompt: str,
+                        user_prompt: str, temperature: float = 0.0) -> str:
+        provider = self._get_provider(event)
         response = await provider.text_chat(
             prompt=user_prompt, system_prompt=system_prompt, temperature=temperature)
         return response.completion_text
@@ -44,7 +58,7 @@ class ReasoningEngine:
             lines.append("")
         return "\n".join(lines) if lines else "（暂无相关记忆）"
 
-    async def build_plan(self, event: AstrMessageEvent, question: str,
+    async def build_plan(self, event: Optional[AstrMessageEvent], question: str,
                          extra_context: str = "") -> Tuple[str, List[MemoryEntry], List[MemoryEntry]]:
         pos, neg = await self.memory_mgr.retrieve_balanced_memories(query=question, pos_top_k=2, neg_top_k=2)
         memories_text = self._format_memories_for_prompt(pos, neg)
@@ -57,13 +71,13 @@ class ReasoningEngine:
         logger.info(f"[Glorious Evolution] build_plan: pos={len(pos)} neg={len(neg)}")
         return plan_text, pos, neg
 
-    async def judge_replan(self, event: AstrMessageEvent, execution_trace: str) -> str:
+    async def judge_replan(self, event: Optional[AstrMessageEvent], execution_trace: str) -> str:
         system_prompt = "You are a critical evaluation assistant. Analyze the execution trace and determine if replanning is needed."
         user_prompt = f"## 执行轨迹\n{execution_trace}\n\n## 输出要求\n请只输出 'yes' 或 'no'"
         result = await self._call_llm(event, system_prompt, user_prompt)
         return "yes" if result.strip().lower().startswith("yes") else "no"
 
-    async def build_replan(self, event: AstrMessageEvent, question: str,
+    async def build_replan(self, event: Optional[AstrMessageEvent], question: str,
                            execution_trace: str) -> str:
         pos, neg = await self.memory_mgr.retrieve_balanced_memories(query=question, pos_top_k=4, neg_top_k=4)
         memories_text = self._format_memories_for_prompt(pos, neg)
