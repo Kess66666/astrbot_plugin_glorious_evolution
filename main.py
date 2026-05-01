@@ -28,6 +28,12 @@ from .memory_manager import MemoryManager
 from .reasoning_engine import ReasoningEngine
 from .evolution_task import EvolutionEngine
 from .tool_sanitizer import sanitize_content, sanitize_tool_output, ENABLE_SANITIZATION, STRICT_TOOL_NAMES
+from .tools import (
+    inject_plugin,
+    StoreMemoryTool, SearchMemoryTool, UpdateWinRateTool,
+    EvictMemoriesTool, GetEvolutionStatsTool, TriggerEvolutionTool,
+    BuildPlanTool, JudgeReplanTool, BuildReplanTool, RunAgentLoopTool,
+)
 
 CST = timezone(timedelta(hours=8))
 
@@ -368,6 +374,25 @@ class GloriousEvolutionPlugin(Star):
         global _plugin_cache
         _plugin_cache = self
 
+        # ── v1.0.10: 注册 LLM Function Tools ──
+        inject_plugin(self)
+        self.context.add_llm_tools(
+            # 记忆 CRUD
+            StoreMemoryTool(),
+            SearchMemoryTool(),
+            UpdateWinRateTool(),
+            # 进化操作
+            EvictMemoriesTool(),
+            GetEvolutionStatsTool(),
+            TriggerEvolutionTool(),
+            # MIA Plan-Judge-Replan 推理
+            BuildPlanTool(),
+            JudgeReplanTool(),
+            BuildReplanTool(),
+            # 完整推理循环
+            RunAgentLoopTool(),
+        )
+
         logger.info(f"[Glorious Evolution] v{VERSION} init (data: {DATA_DIR})")
 
     @staticmethod
@@ -601,10 +626,17 @@ class GloriousEvolutionPlugin(Star):
 
     async def _health_check_loop(self) -> None:
         """
-        v1.0.9 health check: file integrity + DB access + registration.
-        Fires every 30 min. Auto-repairs missing files.
+        v1.0.9 健康自检循环。
+        
+        每 30 分钟检查一次：
+        1. 插件文件完整性（所有必需文件存在且非空）
+        2. SQLite 数据库可访问
+        3. 插件自身仍在 star_map 中注册（防止被外部卸载）
+        
+        违规时立即写入告警日志并尝试自动修复（重新创建空文件）。
+        这是防 Recurrence-Count 升高的最终防线。
         """
-        CHECK_INTERVAL = 30 * 60
+        CHECK_INTERVAL = 30 * 60  # 30 minutes
         logger.info("[GE] health check loop ready (interval: 30 min)")
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -612,6 +644,7 @@ class GloriousEvolutionPlugin(Star):
             try:
                 violations = []
 
+                # 1. 文件完整性检查
                 for fname in self.REQUIRED_FILES:
                     fpath = os.path.join(PLUGIN_DIR, fname)
                     if not os.path.exists(fpath):
@@ -619,6 +652,7 @@ class GloriousEvolutionPlugin(Star):
                     elif os.path.getsize(fpath) == 0:
                         violations.append(f"EMPTY: {fname}")
 
+                # 2. SQLite 数据库检查
                 if os.path.exists(DB_PATH):
                     try:
                         import sqlite3
@@ -628,6 +662,7 @@ class GloriousEvolutionPlugin(Star):
                     except Exception as e:
                         violations.append(f"DB_CORRUPT: {e}")
 
+                # 3. 自身注册检查（确认未被卸载）
                 global _plugin_cache
                 if _plugin_cache is None:
                     try:
@@ -644,9 +679,11 @@ class GloriousEvolutionPlugin(Star):
                     except Exception:
                         violations.append("UNREGISTERED: GlobalStarMap inaccessible")
 
+                # 4. 报告
                 if violations:
-                    logger.error(f"[GE] HEALTH CHECK FAILED: {'; '.join(violations)}")
-                    logger.error("[GE] v1.0.9 execution monitor alert — investigate immediately!")
+                    logger.error(f"[GE] ⚠️ HEALTH CHECK FAILED: {'; '.join(violations)}")
+                    logger.error("[GE] 🔥 这是 v1.0.9 执行监控告警 — 请立即排查!")
+                    # 尝试自动修复缺失文件
                     for v in violations:
                         if v.startswith("MISSING:"):
                             fname = v.split(": ", 1)[1]
@@ -656,7 +693,7 @@ class GloriousEvolutionPlugin(Star):
                                     f.write("")
                                 logger.warning(f"[GE] auto-repair: created empty {fname}")
                 else:
-                    logger.debug("[GE] health check passed")
+                    logger.debug("[GE] health check passed ✅")
 
             except asyncio.CancelledError:
                 break
@@ -728,6 +765,7 @@ class GloriousEvolutionPlugin(Star):
             f"duration={duration:.1f}s"
         )
 
+    @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         if not ENABLE_SANITIZATION:
             return
@@ -878,6 +916,15 @@ async def judge_replan(execution_trace: str) -> str:
     plugin = _get_plugin()
     if not plugin:
         return "❌ plugin not ready"
+    # ── v1.0.10: 优先 LLM 判断，降级关键词匹配 ──
+    if plugin._reasoning_engine:
+        try:
+            result = await plugin._reasoning_engine.judge_replan(
+                event=None, execution_trace=execution_trace,
+            )
+            return "🔄 replan suggested" if result == "yes" else "✅ no replan needed"
+        except RuntimeError:
+            pass
     failure_keywords = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]
     has_failure = any(kw in execution_trace.lower() for kw in failure_keywords)
     return "🔄 replan suggested" if has_failure else "✅ no replan needed"
