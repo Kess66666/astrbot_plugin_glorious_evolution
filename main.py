@@ -735,28 +735,78 @@ class GloriousEvolutionPlugin(Star):
         await self._inject_relevant_memories(req)
 
     async def _inject_relevant_memories(self, req: ProviderRequest) -> None:
+        """v1.0.14: 自动注入相关记忆 + 蒸馏规则，并涨 usage_count（不动 win_rate）。"""
         if not self._memory_mgr:
             return
         prompt = getattr(req, "prompt", "")
-        if isinstance(prompt, str) and len(prompt) > 5:
+        if not isinstance(prompt, str) or len(prompt) <= 5:
+            return
+
+        logger.info(f"[GE] inject start: prompt_len={len(prompt)}")
+
+        # 1. 向量检索
+        try:
+            entries = await self._memory_mgr.retrieve_relevant_memories(
+                query=prompt, top_k=5
+            )
+        except Exception as e:
+            logger.debug(f"[GE] memory retrieval error: {e}")
+            entries = []
+
+        # 2. 蒸馏规则
+        distilled_rules: List[str] = []
+        try:
+            rules = await self._storage.get_distilled_rules(min_win_rate=0.7, limit=3)
+            distilled_rules = [r["content"][:120] for r in rules if r.get("content")]
+        except Exception:
+            pass
+
+        logger.info(f"[GE] retrieved {len(entries)} entries, {len(distilled_rules)} rules")
+
+        # 3. 过滤 + 构建注入块
+        mem_lines = []
+        injected_ids: List[str] = []
+        for e in entries:
+            if e.win_rate > 0 and e.win_rate < 0.2:
+                continue
+            mem_lines.append(f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}")
+            injected_ids.append(e.id)
+
+        logger.info(f"[GE] after filter: {len(injected_ids)} to inject")
+
+        rule_lines = [f"- {r}" for r in distilled_rules]
+
+        injection_parts = []
+        if mem_lines:
+            injection_parts.append("[相关记忆]\n" + "\n".join(mem_lines))
+        if rule_lines:
+            injection_parts.append("[蒸馏规则 (高胜率)]\n" + "\n".join(rule_lines))
+
+        if not injection_parts:
+            return
+
+        injection = "\n\n" + "\n\n".join(injection_parts)
+        sp = getattr(req, "system_prompt", None)
+        if isinstance(sp, str):
+            req.system_prompt = sp + injection
+        else:
+            req.system_prompt = injection
+
+        # 4. usage_count +1
+        for eid in injected_ids:
             try:
-                entries = await self._memory_mgr.retrieve_relevant_memories(
-                    query=prompt, top_k=3
-                )
-                if entries:
-                    mem_lines = [
-                        f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}"
-                        for e in entries
-                    ]
-                    mem_block = "\n".join(mem_lines)
-                    injection = f"\n\n[相关记忆]\n{mem_block}"
-                    sp = getattr(req, "system_prompt", None)
-                    if isinstance(sp, str):
-                        req.system_prompt = sp + injection
-                    else:
-                        req.system_prompt = injection
-            except Exception as e:
-                logger.debug(f"[GE] memory injection error: {e}")
+                await self._memory_mgr.increment_usage(eid)
+            except Exception:
+                pass
+
+        # 5. ID 透传给 Agent Loop judge
+        try:
+            prev = getattr(req, "_ge_injected_mem_ids", None) or []
+            req._ge_injected_mem_ids = prev + injected_ids
+        except Exception:
+            pass
+
+        logger.info(f"[GE] memory injection done: {len(injected_ids)} memories, {len(distilled_rules)} rules")
 
     @staticmethod
     def _detect_last_tool(prompt: str) -> Optional[str]:
