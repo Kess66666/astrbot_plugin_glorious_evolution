@@ -100,7 +100,13 @@ class ReasoningEngine:
                 f"## 输出要求\n"
                 f"只输出一行 JSON（不要 markdown 代码块，不要解释）：\n"
                 f'{{"need_replan": "yes"|"no", "memory_contributions": {{"MEM-xxx": 贡献度, ...}}}}\n\n'
-                f"贡献度: -1.0 = 严重误导, 0 = 无贡献, 1.0 = 关键帮助。只列出有显著贡献(≠0)的记忆。"
+                f"贡献度评分标准（必须为每条记忆打分，包括 0）：\n"
+                f"  1.0  = 关键帮助 — 直接提供了正确方案或核心思路\n"
+                f"  0.5  = 有贡献 — 提供了正确方向或部分有用信息\n"
+                f"  0.0  = 无影响 — 检索到了但没有实际帮助\n"
+                f"  -0.5 = 有误导 — 提供了错误方向或不相关内容\n"
+                f"  -1.0 = 严重误导 — 让推理走上了完全错误的路径\n"
+                f"不要省略任何记忆，即使贡献度为 0 也要列出。"
             )
             result = await self._call_llm(event, system_prompt, user_prompt)
             return self._parse_judge_response(result)

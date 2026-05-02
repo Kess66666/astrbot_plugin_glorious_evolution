@@ -243,8 +243,11 @@ class AgentLoop:
 
         updated = 0
         skipped = 0
+        unmentioned = []
         for mid in all_ids:
             score = memory_scores.get(mid, 0.0)
+            if mid not in memory_scores:
+                unmentioned.append(mid)
             if score == 0.0:
                 skipped += 1
                 continue
@@ -256,8 +259,13 @@ class AgentLoop:
 
         logger.info(
             f"[AgentLoop] 反馈闭环: {updated}/{len(all_ids)} 条记忆更新, "
-            f"{skipped} 条跳过 (judge=LLM逐条评分)"
+            f"{skipped} 条跳过, {len(unmentioned)} 条未提及 (judge=LLM逐条评分)"
         )
+        if unmentioned:
+            logger.warning(
+                f"[AgentLoop] LLM 未提及的记忆: {', '.join(unmentioned[:5])}"
+                f"{'...' if len(unmentioned) > 5 else ''}"
+            )
 
     # ── snippet 构建 ──
 
