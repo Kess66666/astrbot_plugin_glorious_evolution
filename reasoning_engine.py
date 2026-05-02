@@ -4,6 +4,7 @@ MIA 风格的 Plan-Judge-Replan 循环（Phase 2）
 
 v1.0.12: build_replan 返回 (replan_text, pos, neg) 以支持反馈闭环
 v1.0.13: judge_replan 升级为记忆感知评分 — 拿到 memory_snippets 后逐条评价贡献度
+v1.0.15: 修复 judge_replan 中多行 f-string 语法错误（提取 scoring_criteria 为独立变量）
 """
 
 import json
@@ -61,15 +62,35 @@ class ReasoningEngine:
             lines.append("")
         return "\n".join(lines) if lines else "（暂无相关记忆）"
 
+    async def _fetch_distilled_rules(self) -> str:
+        """从 distilled_rules 表获取高胜率规则，格式化为 prompt 段落。"""
+        try:
+            rules = await self.memory_mgr.storage.get_distilled_rules(min_win_rate=0.7, limit=15)
+            if not rules:
+                return ""
+            lines = ["## 🧠 蒸馏规则（已验证的成功模式）"]
+            for r in rules:
+                lines.append(f'- [胜率 {r["avg_win_rate"]:.0%}] {r["content"][:200]}')
+            lines.append("")
+            return "\n".join(lines) + "\n"
+        except Exception as e:
+            logger.error(f"[GE] _fetch_distilled_rules failed: {e}")
+            return ""
+
+
     async def build_plan(self, event: Optional[AstrMessageEvent], question: str,
                          extra_context: str = "") -> Tuple[str, List[MemoryEntry], List[MemoryEntry]]:
         pos, neg = await self.memory_mgr.retrieve_balanced_memories(query=question, pos_top_k=2, neg_top_k=2)
         memories_text = self._format_memories_for_prompt(pos, neg)
+
+        # v1.0.14: 注入蒸馏规则（独立段落，≥0.7 胜率）
+        distilled_text = await self._fetch_distilled_rules()
+
         system_prompt = ("You are a strategic planning assistant. "
                          "Given memories of past successes and failures, create a clear step-by-step action plan.")
-        user_prompt = f"## 问题\n{question}\n\n## 相关记忆\n{memories_text}\n\n## 要求\n请生成分步行动计划（核心目标、2-5具体步骤、风险应对、成功标准）"
+        user_prompt = f"## 问题\n{question}\n\n{distilled_text}## 相关记忆\n{memories_text}\n\n## 要求\n请生成分步行动计划（核心目标、2-5具体步骤、风险应对、成功标准）"
         if extra_context:
-            user_prompt = f"## 问题\n{question}\n\n## 额外上下文\n{extra_context}\n\n## 相关记忆\n{memories_text}\n\n## 要求\n请生成分步行动计划"
+            user_prompt = f"## 问题\n{question}\n\n## 额外上下文\n{extra_context}\n\n{distilled_text}## 相关记忆\n{memories_text}\n\n## 要求\n请生成分步行动计划"
         plan_text = await self._call_llm(event, system_prompt, user_prompt)
         logger.info(f"[Glorious Evolution] build_plan: pos={len(pos)} neg={len(neg)}")
         return plan_text, pos, neg
@@ -94,19 +115,23 @@ class ReasoningEngine:
                 "Determine: 1) whether replanning is needed, "
                 "2) how much each memory contributed to the outcome."
             )
+            # v1.0.15: 提取多行中文评分标准为独立变量，避免 f-string 跨行语法错误
+            scoring_criteria = (
+                "贡献度评分标准（必须为每条记忆打分，包括 0）：\n"
+                "  1.0  = 关键帮助 — 直接提供了正确方案或核心思路\n"
+                "  0.5  = 有贡献 — 提供了正确方向或部分有用信息\n"
+                "  0.0  = 无影响 — 检索到了但没有实际帮助\n"
+                "  -0.5 = 有误导 — 提供了错误方向或不相关内容\n"
+                "  -1.0 = 严重误导 — 让推理走上了完全错误的路径\n"
+                "不要省略任何记忆，即使贡献度为 0 也要列出。"
+            )
             user_prompt = (
                 f"## 执行轨迹\n{execution_trace}\n\n"
                 f"## 使用的记忆（ID: 内容摘要）\n{snippets_block}\n\n"
                 f"## 输出要求\n"
                 f"只输出一行 JSON（不要 markdown 代码块，不要解释）：\n"
                 f'{{"need_replan": "yes"|"no", "memory_contributions": {{"MEM-xxx": 贡献度, ...}}}}\n\n'
-                f"贡献度评分标准（必须为每条记忆打分，包括 0）：\n"
-                f"  1.0  = 关键帮助 — 直接提供了正确方案或核心思路\n"
-                f"  0.5  = 有贡献 — 提供了正确方向或部分有用信息\n"
-                f"  0.0  = 无影响 — 检索到了但没有实际帮助\n"
-                f"  -0.5 = 有误导 — 提供了错误方向或不相关内容\n"
-                f"  -1.0 = 严重误导 — 让推理走上了完全错误的路径\n"
-                f"不要省略任何记忆，即使贡献度为 0 也要列出。"
+                f"{scoring_criteria}"
             )
             result = await self._call_llm(event, system_prompt, user_prompt)
             return self._parse_judge_response(result)

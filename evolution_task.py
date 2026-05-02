@@ -5,13 +5,15 @@ MIA Phase 3: 记忆合并提炼 + Insight 生成 + 后台进化循环
 职责：
 1. consolidate_episodic_memories — 情景记忆向量聚簇 → 陈述性规则提炼
 2. generate_insights — 胜率统计分析 → 可操作洞察
-3. run_evolution_cycle — 合并 + 洞察 + 淘汰完整周期
+3. run_evolution_cycle — 合并 + 洞察 + 蒸馏 + 淘汰完整周期
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from .memory_manager import MemoryManager, _lazy_import_numpy
@@ -55,6 +57,21 @@ class EvolutionEngine:
 
         # LLM 并发信号量
         self._llm_semaphore: asyncio.Semaphore = asyncio.Semaphore(self.LLM_CONCURRENCY)
+
+        # 蒸馏配置（由 main.py 注入）
+        self._distill_config: Dict[str, Any] = {}
+
+    # ── 蒸馏配置注入 ──
+
+    def set_distillation_config(self, config: Dict[str, Any]) -> None:
+        """由 main.py 在初始化时注入蒸馏配置。"""
+        self._distill_config = config
+        logger.info(
+            f"[Evolution] 蒸馏配置: window={config.get('distillation_window_start', 2)}-"
+            f"{config.get('distillation_window_end', 6)}h, "
+            f"batch={config.get('distillation_batch_size', 20)}, "
+            f"interval={config.get('distillation_batch_interval_sec', 1)}s"
+        )
 
     # ── Provider 获取（后台任务专用，无 event） ──
 
@@ -398,7 +415,7 @@ class EvolutionEngine:
 
         by_category = stats.get("by_category", {})
         if by_category:
-            stats_text_lines.append("分类分布: ", ", ".join(
+            stats_text_lines.append("分类分布: " + ", ".join(
                 f"{cat}={c}" for cat, c in by_category.items()
             ))
 
@@ -480,24 +497,145 @@ class EvolutionEngine:
 
         return insight_count
 
+    # ── 记忆蒸馏 (v1.0.14) ──
+
+    async def distill_rules(self) -> int:
+        """将高胜率 declarative/consolidated_rule 记忆蒸馏为可执行规则。
+
+        流程：
+        1. 检查时间窗口
+        2. 取 win_rate >= 0.7 的 declarative + consolidated_rule 记忆
+        3. 分批调用 LLM 蒸馏
+        4. 写入 distilled_rules 表（INSERT OR REPLACE）
+        """
+        # 1. 时间窗口检查
+        now = datetime.now()
+        window_start = self._distill_config.get("distillation_window_start", 2)
+        window_end = self._distill_config.get("distillation_window_end", 6)
+
+        if not (window_start <= now.hour < window_end):
+            logger.debug(
+                f"[Evolution] 蒸馏跳过: 当前 {now.hour}h 不在窗口 {window_start}-{window_end}h 内"
+            )
+            return 0
+
+        # 2. 获取高胜率记忆
+        batch_size = self._distill_config.get("distillation_batch_size", 20)
+        interval_sec = self._distill_config.get("distillation_batch_interval_sec", 1)
+
+        candidates = await self.memory_mgr.get_memories_by_type(
+            "declarative", limit=500, order_by="win_rate DESC",
+        )
+        # 也加入 consolidated_rule 类型（SQL 层过滤）
+        consolidated = await self.memory_mgr.get_memories_by_type(
+            "consolidated_rule", limit=200, order_by="win_rate DESC",
+        )
+        all_candidates = candidates + consolidated
+
+        # 过滤 win_rate >= 0.7
+        high_wr = [e for e in all_candidates if e.win_rate >= 0.7]
+        if not high_wr:
+            logger.info("[Evolution] 蒸馏跳过: 无 win_rate >= 0.7 的记忆")
+            return 0
+
+        logger.info(f"[Evolution] 蒸馏候选: {len(high_wr)} 条高胜率记忆")
+
+        # 3. 分批蒸馏
+        provider = self._get_provider()
+        distilled_count = 0
+        batch_num = 0
+
+        for i in range(0, len(high_wr), batch_size):
+            batch = high_wr[i:i + batch_size]
+            batch_num += 1
+
+            try:
+                rule_text = await self._distill_batch(provider, batch, batch_num)
+                if not rule_text:
+                    continue
+
+                # 计算平均 win_rate
+                source_ids = json.dumps([e.id for e in batch], ensure_ascii=False)
+                avg_wr = round(sum(e.win_rate for e in batch) / len(batch), 4)
+
+                # 存储 — 用源记忆 ID 的 hash 做规则 ID，保证幂等
+                rule_id = f"DR-{hashlib.sha256(source_ids.encode()).hexdigest()[:12]}"
+                ok = await self.memory_mgr.storage.insert_or_replace_distilled_rule(
+                    rule_id=rule_id,
+                    content=rule_text,
+                    source_memory_ids=source_ids,
+                    avg_win_rate=avg_wr,
+                )
+                if ok:
+                    distilled_count += 1
+                    logger.info(
+                        f"[Evolution] 蒸馏 #{batch_num}: {rule_id} "
+                        f"avg_wr={avg_wr:.0%} sources={len(batch)}"
+                    )
+
+                # 限流间隔
+                if i + batch_size < len(high_wr):
+                    await asyncio.sleep(interval_sec)
+
+            except asyncio.TimeoutError:
+                logger.error(f"[Evolution] 蒸馏 #{batch_num} 超时, 继续下一批")
+            except Exception as e:
+                logger.error(f"[Evolution] 蒸馏 #{batch_num} 失败: {e}", exc_info=True)
+
+        logger.info(f"[Evolution] 蒸馏完成: {distilled_count} 条规则")
+        return distilled_count
+
+    async def _distill_batch(
+        self, provider: Any, batch: List, batch_num: int,
+    ) -> Optional[str]:
+        """调用 LLM 将一批高胜率记忆蒸馏为紧凑规则。"""
+        memory_lines = []
+        for idx, entry in enumerate(batch, 1):
+            memory_lines.append(
+                f"{idx}. [win={entry.win_rate:.0%}] {entry.question} → {entry.content[:120]}"
+            )
+
+        system_prompt = (
+            "你是知识蒸馏专家。将多条高胜率记忆提炼为一条可执行的通用规则。"
+            "规则应精简、可操作，包含：(1)触发条件 (2)正确做法 (3)避免事项。"
+            "输出格式为纯文本规则，不超过 200 字。"
+        )
+        # v1.0.15: 修复 f-string 跨行语法错误，改用普通字符串拼接
+        header = f"## 第 {batch_num} 批高胜率记忆\n"
+        footer = "\n\n请蒸馏为一条可执行规则："
+        user_prompt = header + "\n".join(memory_lines) + footer
+
+        async with self._llm_semaphore:
+            async with asyncio.timeout(45):
+                response = await provider.text_chat(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.0,
+                )
+            text = response.completion_text.strip()
+            if len(text) < 10:
+                return None
+            return text
+
     # ── 完整进化周期 ──
 
     async def run_evolution_cycle(self) -> Dict[str, int]:
         """
-        完整进化周期：合并 + 洞察 + 淘汰。
+        完整进化周期：合并 + 洞察 + 蒸馏 + 淘汰。
 
-        使用 _evo_lock 保证同一时间只有一个周期运行。
-
-        Returns:
-            {"consolidated": N, "insights": N, "evicted": N}
+        Returns: {"consolidated": N, "insights": N, "distilled": N, "evicted": N}
         """
         async with self._evo_lock:
             result = {
-                "consolidated": 0,
-                "insights": 0,
-                "evicted": 0,
+                "consolidated": 0, "insights": 0, "distilled": 0, "evicted": 0,
             }
             result["consolidated"] = await self.consolidate_episodic_memories()
             result["insights"] = await self.generate_insights()
+            # 蒸馏：超时不阻塞主循环
+            try:
+                async with asyncio.timeout(120):
+                    result["distilled"] = await self.distill_rules()
+            except asyncio.TimeoutError:
+                logger.warning("[Evolution] 蒸馏超时 (120s)，跳过，下一周期续做")
             result["evicted"] = await self.memory_mgr.evict_low_quality()
             return result
