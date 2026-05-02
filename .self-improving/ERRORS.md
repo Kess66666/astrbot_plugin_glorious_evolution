@@ -8,7 +8,7 @@ Command failures and integration errors.
 
 **Logged**: 2026-05-02T21:23:00+08:00
 **Priority**: critical
-**Status**: pending
+**Status**: resolved
 **Area**: infra
 
 ### Summary
@@ -22,13 +22,13 @@ door 多次使用 `dev_uninstall_plugin` 误删插件目录，导致未提交代
 - 混淆了 `dev_uninstall_plugin`（卸载）与"重载"的概念
 - TOOLS.md 已明文禁止，但未被严格遵循
 
-### Suggested Fix
-- 门禁规则：**任何修改完成后直接推 GitHub，不留未提交变更在本地**
-- 重载插件只用：修改文件 → 框架自动热重载；或 `dev_load_plugin` 装载未安装插件
-- 每次对话开始检查 TOOLS.md 的禁令清单
+### Resolution
+- **Resolved**: 2026-05-02T21:25:00+08:00
+- **Fix**: 直接禁用 `dev_uninstall_plugin` 工具，从根上杜绝误用
+- **Notes**: 物理隔离 > 规则提醒，不再依赖 TOOLS.md 的"自觉遵守"
 
 ### Metadata
-- Reproducible: yes
+- Reproducible: yes (now impossible — tool removed)
 - Related Files: TOOLS.md, REBUILD_PLAN.md, main.py
 - Source: conversation
 - Recurrence-Count: 2
