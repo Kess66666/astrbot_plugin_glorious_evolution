@@ -93,6 +93,15 @@ class Storage:
                     INSERT INTO memories_fts(rowid, question, content)
                     VALUES (new.rowid, new.question, new.content);
                 END;
+
+                CREATE TABLE IF NOT EXISTS distilled_rules (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    source_memory_ids TEXT NOT NULL DEFAULT '[]',
+                    avg_win_rate REAL NOT NULL DEFAULT 0.0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
             """)
             conn.commit()
         finally:
@@ -379,5 +388,99 @@ class Storage:
                     "by_type": by_type, "by_judgement": by_judgement,
                     "by_category": by_category, "top_win_rate": top_wr,
                 }
+            finally:
+                conn.close()
+
+    # ── 蒸馏规则 CRUD (v1.0.14) ──
+
+    async def insert_or_replace_distilled_rule(
+        self,
+        rule_id: str,
+        content: str,
+        source_memory_ids: str = "[]",
+        avg_win_rate: float = 0.0,
+    ) -> bool:
+        """插入或替换一条蒸馏规则。ID 冲突时 REPLACE。"""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                now = datetime.now().isoformat()
+                cursor = conn.execute(
+                    """INSERT OR REPLACE INTO distilled_rules
+                       (id, content, source_memory_ids, avg_win_rate, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM distilled_rules WHERE id = ?), ?), ?)""",
+                    (rule_id, content, source_memory_ids, avg_win_rate,
+                     rule_id, now, now),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
+    async def get_distilled_rules(
+        self,
+        min_win_rate: float = 0.0,
+        limit: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """获取蒸馏规则列表，按 avg_win_rate 降序。"""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """SELECT id, content, source_memory_ids, avg_win_rate, created_at, updated_at
+                       FROM distilled_rules
+                       WHERE avg_win_rate >= ?
+                       ORDER BY avg_win_rate DESC
+                       LIMIT ?""",
+                    (min_win_rate, limit),
+                )
+                rows = cursor.fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+    async def update_distilled_rule(
+        self,
+        rule_id: str,
+        content: Optional[str] = None,
+        avg_win_rate: Optional[float] = None,
+        source_memory_ids: Optional[str] = None,
+    ) -> bool:
+        """更新蒸馏规则的部分字段。"""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                set_clauses = []
+                params: list[Any] = []
+                if content is not None:
+                    set_clauses.append("content = ?")
+                    params.append(content)
+                if avg_win_rate is not None:
+                    set_clauses.append("avg_win_rate = ?")
+                    params.append(avg_win_rate)
+                if source_memory_ids is not None:
+                    set_clauses.append("source_memory_ids = ?")
+                    params.append(source_memory_ids)
+                if not set_clauses:
+                    return False
+                set_clauses.append("updated_at = ?")
+                params.append(datetime.now().isoformat())
+                params.append(rule_id)
+                sql = f"UPDATE distilled_rules SET {', '.join(set_clauses)} WHERE id = ?"
+                cursor = conn.execute(sql, params)
+                conn.commit()
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
+    async def delete_distilled_rule(self, rule_id: str) -> bool:
+        """删除一条蒸馏规则。"""
+        async with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                cursor = conn.execute("DELETE FROM distilled_rules WHERE id = ?", (rule_id,))
+                conn.commit()
+                return cursor.rowcount > 0
             finally:
                 conn.close()
