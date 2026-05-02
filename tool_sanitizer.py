@@ -154,30 +154,36 @@ def sanitize_content(text: str) -> str:
         flags=re.IGNORECASE
     )
     
+    # 避免 rf-string 内正则反斜杠引发 Python 解析歧义，先拼好模式字符串
+    _pat1 = '("' + key_pattern_str + '")\\s*:\\s*"([^"]+)"'
+    _pat2 = "('" + key_pattern_str + "')\\s*:\\s*'([^']+)'"
+    _pat3 = '("' + key_pattern_str + '")\\s*:\\s*(\\S+)'
+    
     result = re.sub(
-        rf'("{key_pattern_str}")\s*:\s*"([^"]+)"',
+        _pat1,
         lambda m: f'{m.group(1)}: "****"',
         result,
         flags=re.IGNORECASE
     )
     
     result = re.sub(
-        rf"('{key_pattern_str}')\s*:\s*'([^']+)',
+        _pat2,
         lambda m: f"{m.group(1)}: '****'",
         result,
         flags=re.IGNORECASE
     )
     
     result = re.sub(
-        rf'("{key_pattern_str}")\s*:\s*(\S+)',
+        _pat3,
         lambda m: f'{m.group(1)}: ****',
         result,
         flags=re.IGNORECASE
     )
     
     cli_key_pattern = r'password|passwd|pwd|token|secret|key|auth|credential'
+    _cli_pat = '--(' + cli_key_pattern + ')=(\\S+)'
     result = re.sub(
-        rf'--({cli_key_pattern})=(\S+)',
+        _cli_pat,
         lambda m: f'--{m.group(1)}=****',
         result,
         flags=re.IGNORECASE
