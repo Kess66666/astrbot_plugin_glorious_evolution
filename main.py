@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.13 - 记忆感知 judge：LLM 逐条评价记忆贡献度，替代粗糙二值映射
+v1.0.16 - 修复蒸馏配置注入：set_distillation_config 在 __init__ 中未调用
 """
 
 import asyncio
@@ -50,7 +50,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.13"
+VERSION = "1.0.16"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -392,6 +392,7 @@ class GloriousEvolutionPlugin(Star):
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
+        self._evo_engine.set_distillation_config(self.config.get("distillation", {}))
         self._agent_loop = AgentLoop(self._reasoning_engine, self._memory_mgr)
         global _plugin_cache
         _plugin_cache = self
