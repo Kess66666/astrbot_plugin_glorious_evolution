@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.16 - 修复蒸馏配置注入：set_distillation_config 在 __init__ 中未调用
+v1.0.18 - on_agent_begin 钩子：在 Agent 启动时向 system prompt 注入记忆
 """
 
 import asyncio
@@ -50,7 +50,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.16"
+VERSION = "1.0.18"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -710,8 +710,88 @@ class GloriousEvolutionPlugin(Star):
             f"duration={duration:.1f}s"
         )
 
+    # ── v1.0.18: on_agent_begin 钩子 ──────────────────────────────────────
+
+    @filter.on_agent_begin()
+    async def on_agent_begin(self, event: AstrMessageEvent, run_context) -> None:
+        """v1.0.18: 用 on_agent_begin 替代 on_llm_request 做记忆注入"""
+        await self._inject_relevant_memories_v2(run_context)
+
+    async def _inject_relevant_memories_v2(self, run_context) -> None:
+        """v1.0.18: 从 run_context.context.event.message_str 取 query，
+        检索相关记忆并追加到 run_context.messages 中 role=system 的消息。"""
+        if not self._memory_mgr:
+            return
+
+        query = getattr(run_context.context.event, "message_str", "")
+        if not query or len(query) <= 5:
+            return
+
+        # 1. 向量检索
+        try:
+            entries = await self._memory_mgr.retrieve_relevant_memories(
+                query=query, top_k=5
+            )
+        except Exception as e:
+            logger.debug(f"[GE] memory retrieval error (v2): {e}")
+            entries = []
+
+        # 2. 蒸馏规则 (高胜率)
+        distilled_rules: List[str] = []
+        try:
+            rules = await self._storage.get_distilled_rules(min_win_rate=0.7, limit=3)
+            distilled_rules = [r["content"][:120] for r in rules if r.get("content")]
+        except Exception:
+            pass
+
+        # 3. 过滤 + 构建注入块
+        mem_lines = []
+        injected_ids: List[str] = []
+        for e in entries:
+            if e.win_rate > 0 and e.win_rate < 0.2:
+                continue
+            mem_lines.append(f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}")
+            injected_ids.append(e.id)
+
+        rule_lines = [f"- {r}" for r in distilled_rules]
+
+        injection_parts = []
+        if mem_lines:
+            injection_parts.append("[相关记忆]\n" + "\n".join(mem_lines))
+        if rule_lines:
+            injection_parts.append("[蒸馏规则 (高胜率)]\n" + "\n".join(rule_lines))
+
+        if not injection_parts:
+            return
+
+        injection = "\n\n" + "\n\n".join(injection_parts)
+
+        # 4. 追加到 run_context.messages 中 role 为 system 的消息
+        for msg in run_context.messages:
+            if getattr(msg, "role", None) == "system":
+                if isinstance(msg.content, str):
+                    msg.content = msg.content + injection
+                else:
+                    msg.content = str(msg.content or "") + injection
+                break
+
+        # 5. usage_count +1
+        for eid in injected_ids:
+            try:
+                await self._memory_mgr.increment_usage(eid)
+            except Exception:
+                pass
+
+        logger.info(
+            f"[GE] memory injection v2 done: {len(injected_ids)} memories, "
+            f"{len(distilled_rules)} rules"
+        )
+
+    # ── 旧版 on_llm_request (保留，验证通过后清理) ─────────────────────────
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        logger.info("[GE] on_llm_request fired")
         if ENABLE_SANITIZATION:
             try:
                 sp = getattr(req, "system_prompt", None)
@@ -742,7 +822,7 @@ class GloriousEvolutionPlugin(Star):
         if not isinstance(prompt, str) or len(prompt) <= 5:
             return
 
-        logger.info(f"[GE] inject start: prompt_len={len(prompt)}")
+        logger.error("[GE] inject start: prompt_len={}".format(len(prompt)))
 
         # 1. 向量检索
         try:
@@ -808,7 +888,6 @@ class GloriousEvolutionPlugin(Star):
 
         logger.info(f"[GE] memory injection done: {len(injected_ids)} memories, {len(distilled_rules)} rules")
 
-    @staticmethod
     def _detect_last_tool(prompt: str) -> Optional[str]:
         patterns = [
             r'Tool Result \(([^)]+)\)',

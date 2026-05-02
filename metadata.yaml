@@ -1,5 +1,5 @@
 name: astrbot_plugin_glorious_evolution
-desc: 光荣进化系统 - MIA 风格的智能记忆与自改进框架 (v1.0.11 安全硬化+计数器修复)
-version: 1.0.11
+desc: 光荣进化系统 - MIA 风格的智能记忆与自改进框架 (v1.0.18 on_agent_begin 记忆注入)
+version: 1.0.18
 author: door
 repo: https://github.com/Kess66666/astrbot_plugin_glorious_evolution
