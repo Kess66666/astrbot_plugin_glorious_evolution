@@ -333,6 +333,15 @@ class MemoryManager:
             self._vectors[entry_id] = (vec, entry.win_rate)
         return ok
 
+    async def increment_usage(self, entry_id: str) -> bool:
+        """纯递增 usage_count，不动 win_rate。"""
+        entry = await self.storage.get_entry(entry_id)
+        if entry is None:
+            return False
+        return await self.storage.update_entry(
+            entry_id, usage_count=entry.usage_count + 1
+        )
+
     async def get_all_memories(self, limit: int = 10000) -> List[MemoryEntry]:
         """封装 storage.get_all_memories，避免外部直接操作 storage。"""
         return await self.storage.get_all_memories(limit=limit)
