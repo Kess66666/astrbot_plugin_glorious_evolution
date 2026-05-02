@@ -2,10 +2,9 @@
 光荣进化系统 - 数据模型
 MIA 风格的记忆条目定义 + Agent Loop 状态机
 
-v1.0.11 修复:
-- 删除 MemoryEntry.update_win_rate()，胜率统一由 MemoryManager.update_win_rate() 管理
-v1.0.12:
-- AgentLoopState 新增 used_memory_ids / used_neg_memory_ids 用于反馈闭环
+v1.0.12: AgentLoopState 新增 used_memory_ids / used_neg_memory_ids
+v1.0.13: AgentLoopState 新增 used_memory_snippets（id→内容摘要），
+         支撑 judge 阶段按记忆粒度评价贡献度
 """
 
 import json
@@ -166,7 +165,7 @@ PHASE_TO_ACTION = {
 
 @dataclass
 class AgentLoopState:
-    """Agent Loop 当前状态（v1.0.12 加入反馈闭环字段）"""
+    """Agent Loop 当前状态（v1.0.13 加入记忆内容追踪以供 judge 评分）"""
     goal: str = ""
     max_iterations: int = 3
     iteration: int = 0
@@ -180,6 +179,8 @@ class AgentLoopState:
     # v1.0.12: 反馈闭环 — 追踪本轮规划所用的记忆 ID
     used_memory_ids: List[str] = field(default_factory=list)
     used_neg_memory_ids: List[str] = field(default_factory=list)
+    # v1.0.13: 记忆内容摘要 — 传给 judge 做逐条贡献评分
+    used_memory_snippets: Dict[str, str] = field(default_factory=dict)
 
     def to_display(self) -> str:
         return (

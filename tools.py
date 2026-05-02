@@ -274,7 +274,7 @@ class JudgeReplanTool(FunctionTool):
                 result = await plugin._reasoning_engine.judge_replan(
                     event=None, execution_trace=execution_trace,
                 )
-                return "🔄 replan suggested" if result == "yes" else "✅ no replan needed"
+                return "🔄 replan suggested" if result["need_replan"] == "yes" else "✅ no replan needed"
             except RuntimeError:
                 pass
         failure_keywords = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]

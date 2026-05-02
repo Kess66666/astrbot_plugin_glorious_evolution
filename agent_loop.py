@@ -3,7 +3,7 @@
 State-driven + LLM-assisted
 
 v1.0.12: 反馈闭环 — JUDGING 阶段自动更新所用记忆的 win_rate
-         (ChatGPT 建议 + Claude 指出的优先级 #1)
+v1.0.13: 记忆感知 judge — 传入片段内容，按记忆粒度逐条评分，替代粗糙二值映射
 """
 
 import asyncio
@@ -66,12 +66,14 @@ class AgentLoop:
     """
     混合 Agent 循环 — State-driven + LLM-assisted
 
-    v1.0.12: 自动反馈闭环 — judge 结果自动写回所用记忆的 win_rate
+    v1.0.13: judge 拿到记忆片段 → 逐条贡献评分 → 精确 win_rate 反馈
     """
+
+    SNIPPET_MAX_LEN = 200  # 每个记忆传给 judge 的最大字符数
 
     def __init__(self, reasoning_engine, memory_mgr=None, max_iterations: int = 3):
         self._engine = reasoning_engine
-        self._memory_mgr = memory_mgr  # v1.0.12: 反馈闭环
+        self._memory_mgr = memory_mgr
         self._sm = StateMachine()
         self._loops: Dict[str, AgentLoopState] = {}
         self._max_iterations = max_iterations
@@ -151,9 +153,10 @@ class AgentLoop:
                 event=None, question=state.goal, extra_context=""
             )
             state.plan = plan_text
-            # v1.0.12: 追踪本轮所用记忆 ID
             state.used_memory_ids = [e.id for e in pos]
             state.used_neg_memory_ids = [e.id for e in neg]
+            # v1.0.13: 存储记忆内容摘要，供 judge 评分
+            state.used_memory_snippets = self._build_snippets(pos + neg)
             state.result = (
                 f"## 🎯 目标\n{state.goal}\n\n"
                 f"## 📋 初始计划\n{plan_text}\n\n"
@@ -171,7 +174,6 @@ class AgentLoop:
 
     async def _do_build_replan(self, state: AgentLoopState) -> None:
         try:
-            # v1.0.12: build_replan 现在也返回 pos/neg
             replan, pos, neg = await self._engine.build_replan(
                 event=None, question=state.goal,
                 execution_trace=state.execution_trace,
@@ -182,6 +184,8 @@ class AgentLoop:
             for mid in new_ids:
                 if mid not in state.used_memory_ids and mid not in state.used_neg_memory_ids:
                     state.used_memory_ids.append(mid)
+            # v1.0.13: 合并新记忆的 snippet
+            state.used_memory_snippets.update(self._build_snippets(pos + neg))
             state.result = (
                 f"## 🔄 修订计划\n\n{replan}\n\n"
                 f"💡 基于失败轨迹重新规划"
@@ -194,25 +198,40 @@ class AgentLoop:
             state.done = True
 
     async def _do_judge(self, state: AgentLoopState) -> None:
-        """LLM 评估 + v1.0.12 反馈闭环：自动更新所用记忆的 win_rate"""
+        """v1.0.13: LLM 评估 + 逐条记忆贡献评分 → 精确 win_rate 反馈"""
         try:
-            need_replan = await self._engine.judge_replan(
-                event=None, execution_trace=state.execution_trace,
+            judge_result = await self._engine.judge_replan(
+                event=None,
+                execution_trace=state.execution_trace,
+                memory_snippets=state.used_memory_snippets if state.used_memory_snippets else None,
             )
+            need_replan = judge_result["need_replan"]
+            memory_scores = judge_result.get("memory_contributions", {})
         except RuntimeError:
+            # LLM Provider 完全不可用 → 关键词兜底，不评记忆
             failure_kw = ["error", "failed", "❌", "exception", "timeout", "refused", "denied"]
             need_replan = "yes" if any(k in state.execution_trace.lower() for k in failure_kw) else "no"
+            memory_scores = {}
 
-        success = need_replan.strip().lower().startswith("no")
-
-        # ── v1.0.12 反馈闭环 ──
-        await self._record_feedback(state, success)
+        # ── v1.0.13 逐条记忆反馈 ──
+        await self._record_feedback(state, memory_scores)
 
         state.result = f"🔍 评估结果: {'需要重规划' if need_replan == 'yes' else '完成'}"
+        if memory_scores:
+            scored = len(memory_scores)
+            pos_count = sum(1 for s in memory_scores.values() if s > 0)
+            neg_count = sum(1 for s in memory_scores.values() if s < 0)
+            state.result += f" (记忆评分: {pos_count}✅/{neg_count}❌/{scored}总)"
         self._sm.next_phase(state, judge_result=need_replan)
 
-    async def _record_feedback(self, state: AgentLoopState, success: bool) -> None:
-        """v1.0.12: 根据 judge 结果自动更新本轮所用记忆的 win_rate。"""
+    async def _record_feedback(self, state: AgentLoopState,
+                                memory_scores: Dict[str, float]) -> None:
+        """v1.0.13: 按记忆粒度更新 win_rate。
+
+        - score > 0  → 标记成功
+        - score < 0  → 标记失败
+        - score == 0 → 跳过（中性，不改动）
+        """
         if not self._memory_mgr:
             logger.warning("[AgentLoop] 无 memory_mgr，跳过反馈闭环")
             return
@@ -223,17 +242,33 @@ class AgentLoop:
             return
 
         updated = 0
+        skipped = 0
         for mid in all_ids:
+            score = memory_scores.get(mid, 0.0)
+            if score == 0.0:
+                skipped += 1
+                continue
             try:
-                await self._memory_mgr.update_win_rate(mid, success)
+                await self._memory_mgr.update_win_rate(mid, score > 0)
                 updated += 1
             except Exception as e:
                 logger.warning(f"[AgentLoop] update_win_rate {mid} failed: {e}")
 
         logger.info(
-            f"[AgentLoop] 反馈闭环: {updated}/{len(all_ids)} 条记忆 "
-            f"→ {'成功' if success else '失败'} (judge={'no' if success else 'yes'})"
+            f"[AgentLoop] 反馈闭环: {updated}/{len(all_ids)} 条记忆更新, "
+            f"{skipped} 条跳过 (judge=LLM逐条评分)"
         )
+
+    # ── snippet 构建 ──
+
+    @classmethod
+    def _build_snippets(cls, memories: List[MemoryEntry]) -> Dict[str, str]:
+        """从 MemoryEntry 列表构建 id → 内容摘要的映射。"""
+        snippets: Dict[str, str] = {}
+        for mem in memories:
+            content = (mem.content or mem.rules or mem.question)[:cls.SNIPPET_MAX_LEN]
+            snippets[mem.id] = content
+        return snippets
 
     # ── 格式化输出 ──
 
