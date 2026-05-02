@@ -1,6 +1,8 @@
 """
 光荣进化系统 - 推理引擎
 MIA 风格的 Plan-Judge-Replan 循环（Phase 2）
+
+v1.0.12: build_replan 返回 (replan_text, pos, neg) 以支持反馈闭环
 """
 
 from typing import Any, List, Optional, Tuple
@@ -21,6 +23,7 @@ class ReasoningEngine:
         self.context = context
 
     def _get_provider(self, event: Optional[AstrMessageEvent] = None) -> Any:
+        """获取 LLM Provider（兼容 event=None 的后台调用场景）。"""
         if event is not None:
             provider = self.context.get_using_provider(umo=event.unified_msg_origin)
             if provider:
@@ -76,7 +79,8 @@ class ReasoningEngine:
         return "yes" if result.strip().lower().startswith("yes") else "no"
 
     async def build_replan(self, event: Optional[AstrMessageEvent], question: str,
-                           execution_trace: str) -> str:
+                           execution_trace: str) -> Tuple[str, List[MemoryEntry], List[MemoryEntry]]:
+        """v1.0.12: 返回 (replan_text, pos_memories, neg_memories) 以支持反馈闭环"""
         pos, neg = await self.memory_mgr.retrieve_balanced_memories(query=question, pos_top_k=4, neg_top_k=4)
         memories_text = self._format_memories_for_prompt(pos, neg)
         system_prompt = ("You are a strategic replanning assistant. "
@@ -85,4 +89,4 @@ class ReasoningEngine:
                        f"## 相关记忆\n{memories_text}\n\n## 要求\n提供补充计划（失败原因、改进建议、避免措施、新行动）")
         replan_text = await self._call_llm(event, system_prompt, user_prompt)
         logger.info(f"[Glorious Evolution] build_replan: pos={len(pos)} neg={len(neg)}")
-        return replan_text
+        return replan_text, pos, neg

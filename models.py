@@ -4,6 +4,8 @@ MIA 风格的记忆条目定义 + Agent Loop 状态机
 
 v1.0.11 修复:
 - 删除 MemoryEntry.update_win_rate()，胜率统一由 MemoryManager.update_win_rate() 管理
+v1.0.12:
+- AgentLoopState 新增 used_memory_ids / used_neg_memory_ids 用于反馈闭环
 """
 
 import json
@@ -13,13 +15,17 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
+# ── 记忆数据模型 ──
+
 class MemoryType(str, Enum):
+    """记忆类型 — MIA 蓝图"""
     PROCEDURAL = "procedural"
     DECLARATIVE = "declarative"
     EPISODIC = "episodic"
 
 
 class Judgement(str, Enum):
+    """评判状态 — MIA 胜率体系"""
     PENDING = "pending"
     CORRECT = "correct"
     INCORRECT = "incorrect"
@@ -27,6 +33,7 @@ class Judgement(str, Enum):
 
 @dataclass
 class MemoryEntry:
+    """MIA 风格的记忆条目。"""
     id: str = ""
     memory_type: MemoryType = MemoryType.PROCEDURAL
     category: str = "general"
@@ -116,7 +123,10 @@ class MemoryEntry:
         )
 
 
+# ── Agent Loop 状态机 ──
+
 class Phase(str, Enum):
+    """Agent Loop 的固定阶段"""
     BUILD_PLAN = "BUILD_PLAN"
     EXECUTING = "EXECUTING"
     JUDGING = "JUDGING"
@@ -127,6 +137,7 @@ class Phase(str, Enum):
 
 
 class Action(str, Enum):
+    """Agent Loop 可执行的动作"""
     BUILD_PLAN = "BUILD_PLAN"
     EXECUTE_PLAN = "EXECUTE_PLAN"
     JUDGE_RESULT = "JUDGE_RESULT"
@@ -155,6 +166,7 @@ PHASE_TO_ACTION = {
 
 @dataclass
 class AgentLoopState:
+    """Agent Loop 当前状态（v1.0.12 加入反馈闭环字段）"""
     goal: str = ""
     max_iterations: int = 3
     iteration: int = 0
@@ -165,6 +177,9 @@ class AgentLoopState:
     result: str = ""
     error: str = ""
     done: bool = False
+    # v1.0.12: 反馈闭环 — 追踪本轮规划所用的记忆 ID
+    used_memory_ids: List[str] = field(default_factory=list)
+    used_neg_memory_ids: List[str] = field(default_factory=list)
 
     def to_display(self) -> str:
         return (
@@ -172,5 +187,6 @@ class AgentLoopState:
             f"Iteration: {self.iteration}/{self.max_iterations}\n"
             f"Phase: {self.phase.value}\n"
             f"Action: {self.action.value}\n"
-            f"Done: {self.done}"
+            f"Done: {self.done}\n"
+            f"Used memories: {len(self.used_memory_ids)} pos + {len(self.used_neg_memory_ids)} neg"
         )

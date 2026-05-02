@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.10 - 记忆闭环：on_llm_request 自动注入相关记忆到 system prompt
+v1.0.12 - 反馈闭环：Agent Loop 的 JUDGING 阶段自动更新所用记忆的 win_rate
 """
 
 import asyncio
@@ -51,7 +51,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.10"
+VERSION = "1.0.12"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -393,7 +393,7 @@ class GloriousEvolutionPlugin(Star):
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
-        self._agent_loop = AgentLoop(self._reasoning_engine)
+        self._agent_loop = AgentLoop(self._reasoning_engine, self._memory_mgr)
         global _plugin_cache
         _plugin_cache = self
         inject_plugin(self)
@@ -661,7 +661,7 @@ class GloriousEvolutionPlugin(Star):
         if not self.vector_store.ready:
             logger.warning("[GE] scan_and_index skip: VectorStore not ready")
             return
-        mem_entries = await self._storage.get_all_entries(limit=10000)
+        mem_entries = await self._storage.get_all_memories(limit=10000)
         if not mem_entries:
             return
         existing_ids: set = set()
