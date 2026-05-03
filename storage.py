@@ -8,11 +8,15 @@ v1.0.11 修复:
 - update_entry key 白名单校验，防 SQL 注入
 - 删除废弃的 storage.update_win_rate()（统一走 MemoryManager.update_win_rate）
 - insert_entry/add_entry 返回值语义修正
+v1.0.21 修复:
+- _sanitize_fts5_query 改用 AND 连接 terms（OR 过于宽泛）
+- get_all_memories 默认 limit 统一为 10000
 """
 
 import asyncio
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -242,14 +246,13 @@ class Storage:
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
         """净化 FTS5 查询字符串，避免特殊字符触发语法错误。"""
-        import re
         safe = re.sub(r'[^\w\u4e00-\u9fff]', ' ', query)
         if not safe.strip():
             return '""'
         terms = safe.split()
         if not terms:
             return '""'
-        return " OR ".join(terms)
+        return " AND ".join(terms)
 
     async def search_entries(
         self,
@@ -293,7 +296,7 @@ class Storage:
 
     # ── 批量读取 ──
 
-    async def get_all_memories(self, limit: int = 1000) -> List[MemoryEntry]:
+    async def get_all_memories(self, limit: int = 10000) -> List[MemoryEntry]:
         """获取所有记忆条目"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)

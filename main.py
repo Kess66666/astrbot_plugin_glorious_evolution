@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.21 - Phase 1: 修复双重注入/竞态/terminate/废弃代码
+v1.0.21 - Phase 2: 补全后台任务/进化入口/清理诊断钩子
 """
 
 import asyncio
@@ -48,7 +48,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.20"
+VERSION = "1.0.21"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -403,29 +403,102 @@ class GloriousEvolutionPlugin(Star):
         )
         logger.info(f"[Glorious Evolution] v{VERSION} init (data: {DATA_DIR})")
 
-    # ── v1.0.20: 诊断钩子 — 验证框架 hook dispatch 是否正常 ────────────────
+    # ── on_llm_request: 脱敏 + 记忆注入 (query 用 event.message_str) ──
+
+    async def _run_evolution(self) -> None:
+        """执行一次完整进化周期，并更新统计。"""
+        import time as _time
+        t0 = _time.monotonic()
+        result = await self._evo_engine.run_evolution_cycle()
+        elapsed = _time.monotonic() - t0
+        self.evo_stats.increment("total_evolutions")
+        self.evo_stats.increment("total_consolidations", result.get("consolidated", 0))
+        self.evo_stats.increment("total_insights", result.get("insights", 0))
+        self.evo_stats.increment("total_evictions", result.get("evicted", 0))
+        self.evo_stats.set("last_evolution_at", datetime.now(CST).isoformat())
+        self.evo_stats.set("last_evolution_duration_sec", round(elapsed, 1))
+        await _backup_all(label="evo")
+        logger.info(
+            f"[GE] evolution cycle done in {elapsed:.1f}s: "
+            f"consolidated={result.get('consolidated', 0)} "
+            f"insights={result.get('insights', 0)} "
+            f"distilled={result.get('distilled', 0)} "
+            f"evicted={result.get('evicted', 0)}"
+        )
+
+    def _start_background_tasks(self) -> None:
+        """启动后台定时任务：进化周期 + 健康检查。"""
+        import time as _time
+        async def _evo_loop():
+            """每 6 小时运行一次进化周期。"""
+            while True:
+                try:
+                    await asyncio.sleep(DEFAULT_EVO_INTERVAL_HOURS * 3600)
+                    await self._run_evolution()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"[GE] evolution loop error: {e}", exc_info=True)
+                    await asyncio.sleep(300)
+
+        async def _health_loop():
+            """每 30 分钟检查 embedding/classifier 状态。"""
+            while True:
+                try:
+                    await asyncio.sleep(1800)
+                    if self._memory_mgr._embed_func is None and self._embedding_provider is None:
+                        await self._init_embedding()
+                    if self._memory_mgr._classify_func is None and self._classifier_llm is None:
+                        await self._init_classifier()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug(f"[GE] health check error: {e}")
+                    await asyncio.sleep(600)
+
+        self._evo_task = asyncio.create_task(_evo_loop())
+        self._health_check_task = asyncio.create_task(_health_loop())
+        logger.info(f"[GE] background tasks started: evo({DEFAULT_EVO_INTERVAL_HOURS}h) + health(30m)")
+
+    async def _init_embedding(self) -> None:
+        """尝试初始化 embedding provider（延迟绑定）。"""
+        try:
+            provider = self.context.get_using_provider()
+            if provider and hasattr(provider, 'embed'):
+                async def _embed_fn(texts):
+                    result = await provider.embed(texts)
+                    return result
+                await self._memory_mgr.set_embed_func(_embed_fn, dim=1536)
+                self._embedding_provider = provider
+                logger.info("[GE] embedding provider initialized")
+        except Exception as e:
+            logger.debug(f"[GE] embedding init deferred: {e}")
+
+    async def _init_classifier(self) -> None:
+        """尝试初始化自动分类器（延迟绑定）。"""
+        try:
+            provider = self.context.get_using_provider()
+            if provider:
+                async def _classify_fn(question: str, content: str) -> str:
+                    async def _llm_call(prompt: str) -> str:
+                        resp = await provider.text_chat(prompt=prompt, system_prompt="", temperature=0.0)
+                        return resp.completion_text
+                    result = await classify_memory(question, content, _llm_call)
+                    return result.get("category", "general")
+                await self._memory_mgr.set_classify_func(_classify_fn)
+                self._classifier_llm = provider
+                logger.info("[GE] classifier initialized")
+        except Exception as e:
+            logger.debug(f"[GE] classifier init deferred: {e}")
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
-        """诊断钩子: 验证 on_astrbot_loaded 是否被 dispatch"""
-        msg = "[GE] 🧪 DIAG: on_astrbot_loaded FIRED — hook dispatch works"
-        logger.info(msg)
-        try:
-            astr_logger.info(msg)
-        except Exception:
-            pass
-
-    @filter.on_decorating_result()
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        """诊断钩子: 验证 on_decorating_result 是否在发送消息前触发"""
-        logger.info("[GE] 🧪 DIAG: on_decorating_result FIRED — pre-send hook works")
-        try:
-            astr_logger.info("[GE] 🧪 DIAG: on_decorating_result FIRED")
-        except Exception:
-            pass
-
-    # ── on_llm_request: 脱敏 + 记忆注入 (query 用 event.message_str) ──
-    # ── 旧版 on_llm_request (保留，验证通过后清理) ─────────────────────────
+        """框架加载完成后，初始化向量化 + 分类器 + 启动后台任务。"""
+        logger.info("[GE] on_astrbot_loaded: initializing embedding, classifier, background tasks...")
+        await self._memory_mgr.load_vectors()
+        await self._init_embedding()
+        await self._init_classifier()
+        self._start_background_tasks()
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
