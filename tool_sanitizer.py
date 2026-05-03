@@ -154,7 +154,6 @@ def sanitize_content(text: str) -> str:
         flags=re.IGNORECASE
     )
     
-    # 避免 rf-string 内正则反斜杠引发 Python 解析歧义，先拼好模式字符串
     _pat1 = '("' + key_pattern_str + '")\\s*:\\s*"([^"]+)"'
     _pat2 = "('" + key_pattern_str + "')\\s*:\\s*'([^']+)'"
     _pat3 = '("' + key_pattern_str + '")\\s*:\\s*(\\S+)'
@@ -218,25 +217,3 @@ def sanitize_tool_output(tool_name: str, content: str) -> str:
         )
     
     return result
-
-
-if __name__ == "__main__":
-    test_cases = [
-        ("OpenAI Key: sk-abcdefghijklmnopqrstuvwxyz12345678901234", "应脱敏 OpenAI Key"),
-        ("Token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn", "应脱敏 GitHub Personal Token"),
-        ("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "应脱敏 Bearer Token"),
-        ("api_key=sk-supersecretkey123456789012345678901234", "应脱敏 Key=Value"),
-        ('{"api_key": "sk-secretvalue123456789012345678901234567890"}', "应脱敏 JSON"),
-        ("--password=mysecretpassword12345678901234", "应脱敏 CLI 参数"),
-        ("File path: /home/user/config.json", "不应脱敏文件路径"),
-        ("Visit https://example.com/api/docs", "不应脱敏 URL"),
-        ("UUID: 550e8400-e29b-41d4-a716-446655440000", "不应脱敏 UUID"),
-        ("SHA256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "不应脱敏 SHA-256"),
-    ]
-    print("=" * 60)
-    print("Tool Sanitizer 测试")
-    print("=" * 60)
-    for i, (text, desc) in enumerate(test_cases, 1):
-        print(f"\n--- 测试 {i}: {desc} ---")
-        print(f"输入: {text}")
-        print(f"输出: {sanitize_content(text)}")
