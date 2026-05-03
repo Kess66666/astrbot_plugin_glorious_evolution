@@ -6,6 +6,10 @@ v1.0.11 修复:
 - _id_counter 从 SQLite MAX(id) 恢复，避免重启碰撞
 - 删除对 storage.update_win_rate() 的依赖（已从 storage 中删除）
 - evict_low_quality 提高门限：usage_count >= 3 才参与淘汰，避免冷启动惩罚
+
+v1.0.20 修复:
+- _build_entry win_rate 初始值 0.0 → 0.5（中性值）
+- evict_low_quality 增加 judgement != PENDING 保护，不杀未评分记忆
 """
 
 from datetime import datetime
@@ -99,7 +103,7 @@ class MemoryManager:
         return MemoryEntry(
             id=entry_id, memory_type=MemoryType(memory_type), category=category,
             question=question, content=content, trajectory=trajectory, rules=rules,
-            judgement=Judgement.PENDING, usage_count=0, success_count=0, win_rate=0.0,
+            judgement=Judgement.PENDING, usage_count=0, success_count=0, win_rate=0.5,
             embedding=embedding, tags=tags or [], related_ids=[],
         )
 
@@ -355,7 +359,10 @@ class MemoryManager:
         evicted = 0
         for entry in entries:
             # 修复：usage_count 必须 >= EVICT_MIN_USAGE 才参与淘汰（>=3），避免冷启动惩罚
-            if entry.usage_count >= self.EVICT_MIN_USAGE and entry.win_rate < self.EVICT_MAX_WIN_RATE:
+            # v1.0.20: 增加 judgement != PENDING 保护，不淘汰未评分的记忆
+            if (entry.usage_count >= self.EVICT_MIN_USAGE 
+                and entry.win_rate < self.EVICT_MAX_WIN_RATE
+                and entry.judgement != Judgement.PENDING):
                 if await self.storage.delete_entry(entry.id):
                     self._vectors.pop(entry.id, None)
                     evicted += 1
