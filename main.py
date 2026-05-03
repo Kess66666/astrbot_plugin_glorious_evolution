@@ -392,7 +392,8 @@ class GloriousEvolutionPlugin(Star):
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
-        self._evo_engine.set_distillation_config self.config.get("distillation", {})
+        # fix: 补回漏掉的括号
+        self._evo_engine.set_distillation_config(self.config.get("distillation", {}))
         self._agent_loop = AgentLoop(self._reasoning_engine, self._memory_mgr)
         global _plugin_cache
         _plugin_cache = self
