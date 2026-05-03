@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.19 - on_llm_request 改用 event.message_str 做 query，提升检索相关性
+v1.0.21 - Phase 1: 修复双重注入/竞态/terminate/废弃代码
 """
 
 import asyncio
@@ -15,10 +15,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-
 from astrbot.api.star import Star, Context
-from astrbot.api import logger
+from astrbot.api import logger as astr_logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.provider import ProviderRequest
 
@@ -50,7 +48,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.19"
+VERSION = "1.0.20"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -392,7 +390,6 @@ class GloriousEvolutionPlugin(Star):
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
-        # fix: 补回漏掉的括号
         self._evo_engine.set_distillation_config(self.config.get("distillation", {}))
         self._agent_loop = AgentLoop(self._reasoning_engine, self._memory_mgr)
         global _plugin_cache
@@ -406,398 +403,37 @@ class GloriousEvolutionPlugin(Star):
         )
         logger.info(f"[Glorious Evolution] v{VERSION} init (data: {DATA_DIR})")
 
-    @staticmethod
-    def _pick_embedding_provider(providers: list) -> Optional[Any]:
-        if not providers:
-            return None
-        PREFERRED_STRICT = ["Qwen3-Embedding-8B", "Qwen3-VL-Embedding-8B"]
-        PREFERRED_FUZZY = ["Qwen3"]
-        for pref in PREFERRED_STRICT + PREFERRED_FUZZY:
-            for p in providers:
-                pid = getattr(p, 'id', '') + ' ' + getattr(p, 'model', '')
-                if pref.lower() in pid.lower():
-                    return p
-        return providers[0]
+    # ── v1.0.20: 诊断钩子 — 验证框架 hook dispatch 是否正常 ────────────────
 
-    async def _init_embedding_provider(self) -> None:
-        if self.vector_store.ready:
-            return
-        emb_providers = self.context.get_all_embedding_providers()
-        if emb_providers and len(emb_providers) > 0:
-            self._embedding_provider = self._pick_embedding_provider(emb_providers)
-            pid = getattr(self._embedding_provider, 'id', 'unknown')
-            dim = self._embedding_provider.get_dim() if hasattr(self._embedding_provider, 'get_dim') else '?'
-            logger.info(f"[GE] EmbeddingProvider ready (instant): {pid} (dim={dim})")
-            await self._setup_embed_fn_and_collection()
-            return
-        if (not hasattr(self, '_embedding_retry_task') or
-                self._embedding_retry_task is None or self._embedding_retry_task.done()):
-            logger.info("[GE] EmbeddingProvider not ready, starting background retry...")
-            self._embedding_retry_task = asyncio.create_task(self._retry_init_embedding())
-
-    async def _retry_init_embedding(self):
-        MAX_RETRIES = 60
-        base_delay = 2.0
-        max_delay = 30.0
-        log_interval = 10
-        for attempt in range(1, MAX_RETRIES + 1):
-            delay = min(base_delay * (1.5 ** (attempt - 1)), max_delay)
-            await asyncio.sleep(delay)
-            emb_providers = self.context.get_all_embedding_providers()
-            if emb_providers and len(emb_providers) > 0:
-                self._embedding_provider = self._pick_embedding_provider(emb_providers)
-                pid = getattr(self._embedding_provider, 'id', 'unknown')
-                dim = self._embedding_provider.get_dim() if hasattr(self._embedding_provider, 'get_dim') else '?'
-                logger.info(f"[GE] EmbeddingProvider ready (attempt {attempt}): {pid} (dim={dim})")
-                await self._setup_embed_fn_and_collection()
-                return
-            if attempt % log_interval == 0:
-                next_delay = min(delay * 1.5, max_delay)
-                logger.info(f"[GE] waiting EmbeddingProvider... (attempt {attempt}/{MAX_RETRIES}, next delay {next_delay:.1f}s)")
-        logger.error(f"[GE] {MAX_RETRIES} retries, no EmbeddingProvider found")
-
-    async def _setup_embed_fn_and_collection(self):
-        ep = self._embedding_provider
-        async def embed_fn(texts):
-            return await ep.get_embeddings(texts)
-        self.vector_store.set_embed_fn(embed_fn)
-        self.vector_store.init_collection()
-        dim = ep.get_dim() if hasattr(ep, 'get_dim') else '?'
-        logger.info(f"[GE] ChromaDB collection ready (dim={dim})")
-        await self.vector_store.load_vectors_from_store(self.memory_store)
-        logger.info(f"[GE] vector backfill done ({self.vector_store.count()} total)")
-        dim = ep.get_dim() if hasattr(ep, 'get_dim') else 0
-        if dim > 0:
-            async def _mem_mgr_embed(text):
-                result = await ep.get_embeddings([text])
-                return result[0] if result else None
-            await self._memory_mgr.set_embed_func(_mem_mgr_embed, dim)
-            await self._memory_mgr.load_vectors()
-            logger.info("[GE] MemoryManager embed hook injected")
-
-    async def _init_classifier(self):
-        if self._classifier_llm is not None:
-            return
-        if self._try_setup_classifier():
-            return
-        if (not hasattr(self, '_classifier_retry_task') or
-                self._classifier_retry_task is None or self._classifier_retry_task.done()):
-            logger.info("[GE] classifier LLM not ready, starting background retry...")
-            self._classifier_retry_task = asyncio.create_task(self._retry_init_classifier())
-
-    def _try_setup_classifier(self) -> bool:
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """诊断钩子: 验证 on_astrbot_loaded 是否被 dispatch"""
+        msg = "[GE] 🧪 DIAG: on_astrbot_loaded FIRED — hook dispatch works"
+        logger.info(msg)
         try:
-            all_providers = self.context.get_all_providers()
-            if not all_providers:
-                return False
-            for idx, p in enumerate(all_providers):
-                if not hasattr(p, "text_chat"):
-                    continue
-                pid = getattr(p, 'id', str(p))
-                async def llm_call(prompt, _provider=p):
-                    req = ProviderRequest(
-                        prompt=prompt, image_urls=[], urls=[],
-                        func_tool=None, session=None, context_compress=False,
-                    )
-                    resp = await _provider.text_chat(req)
-                    return resp.completion_text if resp else ""
-                self._classifier_llm = llm_call
-                logger.info(f"[GE] classifier LLM ready: {pid}")
-                async def _classify_mem(q, c):
-                    classification = await classify_memory(q, c, llm_call)
-                    return classification.get("category", "general")
-                self._classify_task = asyncio.ensure_future(
-                    self._memory_mgr.set_classify_func(_classify_mem)
-                )
-                logger.info("[GE] MemoryManager classify hook injected")
-                return True
-            logger.warning("[GE] get_all_providers returned list but no text_chat")
-        except Exception as e:
-            logger.warning(f"[GE] classifier probe error: {e}")
-        return False
-
-    async def _retry_init_classifier(self):
-        MAX_RETRIES = 60
-        base_delay = 2.0
-        max_delay = 30.0
-        log_interval = 10
-        for attempt in range(1, MAX_RETRIES + 1):
-            delay = min(base_delay * (1.5 ** (attempt - 1)), max_delay)
-            await asyncio.sleep(delay)
-            if self._try_setup_classifier():
-                return
-            if attempt % log_interval == 0:
-                next_delay = min(delay * 1.5, max_delay)
-                logger.info(f"[GE] waiting classifier LLM... (attempt {attempt}/{MAX_RETRIES}, next delay {next_delay:.1f}s)")
-        logger.error(f"[GE] {MAX_RETRIES} retries, no classifier LLM found")
-
-    async def initialize(self) -> None:
-        try:
-            await self._init_embedding_provider()
-        except Exception as e:
-            logger.error(f"[GE] embedding init failed: {e}")
-        asyncio.create_task(self._init_classifier())
-        try:
-            await self._scan_and_index()
-        except Exception as e:
-            logger.error(f"[GE] scan_and_index failed: {e}")
-        asyncio.create_task(self._delayed_scan_and_index())
-        self._evo_task = asyncio.create_task(self._evolution_loop())
-        self._health_check_task = asyncio.create_task(self._health_check_loop())
-        logger.info(f"[Glorious Evolution] v{VERSION} started (data: {DATA_DIR})")
-
-    async def _delayed_scan_and_index(self):
-        await asyncio.sleep(30)
-        try:
-            await self._scan_and_index()
-        except Exception as e:
-            logger.error(f"[GE] delayed_scan_and_index error: {e}", exc_info=True)
-
-    async def terminate(self) -> None:
-        logger.info("[GE] final backup before shutdown...")
-        try:
-            await _backup_all(label="shutdown")
-        except Exception as e:
-            logger.warning(f"[GE] shutdown backup failed: {e}")
-        if self._evo_task:
-            self._evo_task.cancel()
-            try:
-                await self._evo_task
-            except asyncio.CancelledError:
-                pass
-            self._evo_task = None
-        if self._classify_task and not self._classify_task.done():
-            self._classify_task.cancel()
-            try:
-                await asyncio.shield(self._classify_task)
-            except asyncio.CancelledError:
-                pass
-            self._classify_task = None
-        if self._health_check_task and not self._health_check_task.done():
-            self._health_check_task.cancel()
-            try:
-                await self._health_check_task
-            except asyncio.CancelledError:
-                pass
-            self._health_check_task = None
-
-    async def _evolution_loop(self) -> None:
-        INTERVAL_SECONDS = 360 * 60
-        logger.info(f"[GE] evolution loop ready, first cycle in {INTERVAL_SECONDS//60} min")
-        await asyncio.sleep(INTERVAL_SECONDS)
-        while True:
-            try:
-                await self._scan_and_index()
-                await self._run_evolution()
-                asyncio.create_task(_backup_all(label="evo"))
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[GE] evolution loop error: {e}")
-            await asyncio.sleep(INTERVAL_SECONDS)
-
-    REQUIRED_FILES = [
-        "main.py", "__init__.py", "models.py", "storage.py",
-        "memory_manager.py", "reasoning_engine.py", "evolution_task.py",
-        "tool_sanitizer.py", "metadata.yaml", "_conf_schema.json",
-    ]
-
-    async def _health_check_loop(self) -> None:
-        CHECK_INTERVAL = 30 * 60
-        logger.info("[GE] health check loop ready (interval: 30 min)")
-        await asyncio.sleep(CHECK_INTERVAL)
-        while True:
-            try:
-                violations = []
-                for fname in self.REQUIRED_FILES:
-                    fpath = os.path.join(PLUGIN_DIR, fname)
-                    if not os.path.exists(fpath):
-                        violations.append(f"MISSING: {fname}")
-                    elif os.path.getsize(fpath) == 0:
-                        violations.append(f"EMPTY: {fname}")
-                if os.path.exists(DB_PATH):
-                    try:
-                        import sqlite3
-                        conn = sqlite3.connect(DB_PATH)
-                        conn.execute("SELECT COUNT(*) FROM memories")
-                        conn.close()
-                    except Exception as e:
-                        violations.append(f"DB_CORRUPT: {e}")
-                global _plugin_cache
-                if _plugin_cache is None:
-                    try:
-                        from astrbot.api.star import GlobalStarMap
-                        star_map = GlobalStarMap()
-                        found = False
-                        for v in star_map.star_map.values():
-                            if isinstance(v, GloriousEvolutionPlugin):
-                                _plugin_cache = v
-                                found = True
-                                break
-                        if not found:
-                            violations.append("UNREGISTERED: plugin not in star_map")
-                    except Exception:
-                        violations.append("UNREGISTERED: GlobalStarMap inaccessible")
-                if violations:
-                    logger.error(f"[GE] HEALTH CHECK FAILED: {'; '.join(violations)}")
-                    for v in violations:
-                        if v.startswith("MISSING:"):
-                            fname = v.split(": ", 1)[1]
-                            fpath = os.path.join(PLUGIN_DIR, fname)
-                            if not os.path.exists(fpath):
-                                with open(fpath, "w") as f:
-                                    f.write("")
-                                logger.warning(f"[GE] auto-repair: created empty {fname}")
-                else:
-                    logger.debug("[GE] health check passed")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[GE] health check error: {e}")
-            await asyncio.sleep(CHECK_INTERVAL)
-
-    async def _scan_and_index(self):
-        if not self.vector_store.ready:
-            await self._init_embedding_provider()
-        if not self.vector_store.ready:
-            logger.warning("[GE] scan_and_index skip: VectorStore not ready")
-            return
-        mem_entries = await self._storage.get_all_memories(limit=10000)
-        if not mem_entries:
-            return
-        existing_ids: set = set()
-        try:
-            existing = self.vector_store._collection.get()
-            if existing and existing.get("ids"):
-                existing_ids = set(existing["ids"])
-        except Exception:
-            pass
-        indexed = 0
-        for entry in mem_entries:
-            eid = entry.id
-            if eid in existing_ids:
-                continue
-            text = _entry_to_text(entry)
-            await self.vector_store.add(eid, text)
-            indexed += 1
-        logger.info(f"[GE] scan_and_index: {indexed}/{len(mem_entries)} new (total {self.vector_store.count()})")
-
-    async def _run_evolution(self):
-        start_ts = time.time()
-        logger.info("[GE] evolution cycle started (EvolutionEngine)...")
-        try:
-            result = await asyncio.wait_for(
-                self._evo_engine.run_evolution_cycle(),
-                timeout=self._evo_engine.CYCLE_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error("[GE] EvolutionEngine timeout (300s), skip")
-            return
-        except Exception as e:
-            logger.error(f"[GE] EvolutionEngine error: {e}", exc_info=True)
-            return
-        duration = time.time() - start_ts
-        self.evo_stats.increment("total_evolutions")
-        self.evo_stats.increment("total_insights", result.get("insights", 0))
-        self.evo_stats.increment("total_consolidations", result.get("consolidated", 0))
-        self.evo_stats.increment("total_evictions", result.get("evicted", 0))
-        self.evo_stats.set("last_evolution_at", datetime.now(CST).isoformat())
-        self.evo_stats.set("last_evolution_duration_sec", round(duration, 2))
-        logger.info(
-            f"[GE] evolution done: "
-            f"consolidated={result.get('consolidated', 0)} "
-            f"insights={result.get('insights', 0)} "
-            f"evicted={result.get('evicted', 0)} "
-            f"duration={duration:.1f}s"
-        )
-
-    # ── v1.0.18: on_agent_begin 钩子 ──────────────────────────────────────
-
-    @filter.on_agent_begin()
-    async def on_agent_begin(self, event: AstrMessageEvent, run_context) -> None:
-        """v1.0.18: 用 on_agent_begin 替代 on_llm_request 做记忆注入"""
-        logger.info("[GE] on_agent_begin FIRED ✅")
-        await self._inject_relevant_memories_v2(run_context)
-
-    async def _inject_relevant_memories_v2(self, run_context) -> None:
-        """v1.0.18: 从 run_context.context.event.message_str 取 query，
-        检索相关记忆并追加到 run_context.messages 中 role=system 的消息。"""
-        if not self._memory_mgr:
-            logger.warning("[GE] _inject_relevant_memories_v2: MemoryManager not ready")
-            return
-
-        query = getattr(run_context.context.event, "message_str", "")
-        logger.info(f"[GE] _inject_relevant_memories_v2: query='{query[:80]}' len={len(query)}")
-        if not query or len(query) <= 5:
-            return
-
-        # 1. 向量检索
-        try:
-            entries = await self._memory_mgr.retrieve_relevant_memories(
-                query=query, top_k=5
-            )
-        except Exception as e:
-            logger.debug(f"[GE] memory retrieval error (v2): {e}")
-            entries = []
-
-        # 2. 蒸馏规则 (高胜率)
-        distilled_rules: List[str] = []
-        try:
-            rules = await self._storage.get_distilled_rules(min_win_rate=0.7, limit=3)
-            distilled_rules = [r["content"][:120] for r in rules if r.get("content")]
+            astr_logger.info(msg)
         except Exception:
             pass
 
-        # 3. 过滤 + 构建注入块
-        mem_lines = []
-        injected_ids: List[str] = []
-        for e in entries:
-            # v1.0.18-patch: 关闭过滤，让所有检索结果都能注入
-            # 之前 < 0.2 门槛把 pending(win=0) 记忆也错误跳过了
-            # if e.win_rate > 0 and e.win_rate < 0.2:
-            #     continue
-            mem_lines.append(f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}")
-            injected_ids.append(e.id)
+    @filter.on_decorating_result()
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        """诊断钩子: 验证 on_decorating_result 是否在发送消息前触发"""
+        logger.info("[GE] 🧪 DIAG: on_decorating_result FIRED — pre-send hook works")
+        try:
+            astr_logger.info("[GE] 🧪 DIAG: on_decorating_result FIRED")
+        except Exception:
+            pass
 
-        rule_lines = [f"- {r}" for r in distilled_rules]
-
-        injection_parts = []
-        if mem_lines:
-            injection_parts.append("[相关记忆]\n" + "\n".join(mem_lines))
-        if rule_lines:
-            injection_parts.append("[蒸馏规则 (高胜率)]\n" + "\n".join(rule_lines))
-
-        if not injection_parts:
-            return
-
-        injection = "\n\n" + "\n\n".join(injection_parts)
-
-        # 4. 追加到 run_context.messages 中 role 为 system 的消息
-        for msg in run_context.messages:
-            if getattr(msg, "role", None) == "system":
-                if isinstance(msg.content, str):
-                    msg.content = msg.content + injection
-                else:
-                    msg.content = str(msg.content or "") + injection
-                break
-
-        # 5. usage_count +1
-        for eid in injected_ids:
-            try:
-                await self._memory_mgr.increment_usage(eid)
-            except Exception:
-                pass
-
-        logger.info(
-            f"[GE] memory injection v2 done: {len(injected_ids)} memories, "
-            f"{len(distilled_rules)} rules"
-        )
-
+    # ── on_llm_request: 脱敏 + 记忆注入 (query 用 event.message_str) ──
     # ── 旧版 on_llm_request (保留，验证通过后清理) ─────────────────────────
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         logger.info("[GE] on_llm_request fired")
+        try:
+            astr_logger.info("[GE] on_llm_request fired")
+        except Exception:
+            pass
         if ENABLE_SANITIZATION:
             try:
                 sp = getattr(req, "system_prompt", None)
@@ -805,7 +441,7 @@ class GloriousEvolutionPlugin(Star):
                     req.system_prompt = sanitize_content(sp)
                 prompt = getattr(req, "prompt", None)
                 if isinstance(prompt, str) and len(prompt) > 10:
-                    tool_name = self._detect_last_tool(prompt)
+                    tool_name = GloriousEvolutionPlugin._detect_last_tool(prompt)
                     if tool_name and tool_name in STRICT_TOOL_NAMES:
                         req.prompt = sanitize_tool_output(tool_name, prompt)
                     else:
@@ -890,6 +526,7 @@ class GloriousEvolutionPlugin(Star):
 
         logger.info(f"[GE] memory injection done: {len(injected_ids)} memories, {len(distilled_rules)} rules")
 
+    @staticmethod
     def _detect_last_tool(prompt: str) -> Optional[str]:
         patterns = [
             r'Tool Result \(([^)]+)\)',
@@ -901,6 +538,35 @@ class GloriousEvolutionPlugin(Star):
             if matches:
                 return matches[-1].group(1)
         return None
+
+    async def terminate(self) -> None:
+        """取消所有后台任务，最后备份一次。"""
+        logger.info("[GE] terminate: cancelling background tasks & backing up...")
+        for task_name, task in [
+            ("_evo_task", self._evo_task),
+            ("_classify_task", self._classify_task),
+            ("_health_check_task", self._health_check_task),
+            ("_embedding_retry_task", self._embedding_retry_task),
+            ("_classifier_retry_task", self._classifier_retry_task),
+            ("_agent_loop_task", self._agent_loop_task),
+        ]:
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                logger.debug(f"[GE] cancelled {task_name}")
+        self._evo_task = None
+        self._classify_task = None
+        self._health_check_task = None
+        self._embedding_retry_task = None
+        self._classifier_retry_task = None
+        self._agent_loop_task = None
+        try:
+            await _backup_all(label="shutdown")
+        except Exception as e:
+            logger.warning(f"[GE] shutdown backup failed: {e}")
 
     @filter.command("ges")
     async def cmd_stats(self, event: AstrMessageEvent):

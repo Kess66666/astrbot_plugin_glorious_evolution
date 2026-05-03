@@ -126,7 +126,7 @@ class EvolutionEngine:
         )
 
         async with self._llm_semaphore:
-            async with asyncio.timeout(30):
+            async with asyncio.timeout(45):
                 response = await provider.text_chat(
                     prompt=user_prompt,
                     system_prompt=system_prompt,
@@ -390,7 +390,7 @@ class EvolutionEngine:
             return 0
 
         # 排序
-        used_entries.sort(key=lambda e: e.win_rate, reverse=True)
+        used_entries.sort(key=lambda e: (-e.win_rate, -e.usage_count))
         top5 = used_entries[:5]
         bottom5 = used_entries[-5:] if len(used_entries) >= 5 else used_entries
 
@@ -629,13 +629,16 @@ class EvolutionEngine:
             result = {
                 "consolidated": 0, "insights": 0, "distilled": 0, "evicted": 0,
             }
-            result["consolidated"] = await self.consolidate_episodic_memories()
-            result["insights"] = await self.generate_insights()
-            # 蒸馏：超时不阻塞主循环
             try:
-                async with asyncio.timeout(120):
-                    result["distilled"] = await self.distill_rules()
+                async with asyncio.timeout(self.CYCLE_TIMEOUT):
+                    result["consolidated"] = await self.consolidate_episodic_memories()
+                    result["insights"] = await self.generate_insights()
+                    try:
+                        async with asyncio.timeout(120):
+                            result["distilled"] = await self.distill_rules()
+                    except asyncio.TimeoutError:
+                        logger.warning("[Evolution] 蒸馏超时 (120s)，跳过，下一周期续做")
+                    result["evicted"] = await self.memory_mgr.evict_low_quality()
             except asyncio.TimeoutError:
-                logger.warning("[Evolution] 蒸馏超时 (120s)，跳过，下一周期续做")
-            result["evicted"] = await self.memory_mgr.evict_low_quality()
+                logger.warning(f"[Evolution] 整体进化周期超时 ({self.CYCLE_TIMEOUT}s)，本轮部分完成")
             return result

@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import uuid
 from typing import Any, Dict, List, Optional
 
 
@@ -52,7 +53,7 @@ class MemoryEntry:
 
     def __post_init__(self) -> None:
         if not self.id:
-            self.id = f"MEM-{id(self) % 1000:03d}"
+            self.id = f"MEM-{uuid.uuid4().hex[:8]}"
 
     def to_db_dict(self) -> Dict[str, Any]:
         embedding_str = None
