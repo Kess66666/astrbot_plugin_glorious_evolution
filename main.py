@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.17 - 恢复稳定版 on_llm_request 钩子
+v1.0.20 - win_rate 初始值 0.5 + eviction 增加 PENDING 保护
 """
 
 import asyncio
@@ -50,7 +50,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.17"
+VERSION = "1.0.20"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -59,17 +59,22 @@ _plugin_cache: Optional["GloriousEvolutionPlugin"] = None
 
 
 def _ensure_data_dir() -> None:
+    """Ensure data dir and migrate from old locations."""
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
+
     if not os.path.exists(DB_PATH) and os.path.exists(OLD_DB_PATH):
         shutil.copy2(OLD_DB_PATH, DB_PATH)
         logger.info(f"[GE] migrated: evolution.db -> {DATA_DIR}/")
+
     if not os.path.exists(EVO_STATS_FILE) and os.path.exists(OLD_STATS_PATH):
         shutil.copy2(OLD_STATS_PATH, EVO_STATS_FILE)
         logger.info(f"[GE] migrated: evolution_stats.json -> {DATA_DIR}/")
+
     if not os.path.exists(CHROMA_PATH) and os.path.exists(OLD_CHROMA_PATH):
         shutil.copytree(OLD_CHROMA_PATH, CHROMA_PATH)
         logger.info(f"[GE] migrated: chroma_db -> {DATA_DIR}/")
+
     old_mem = os.path.join(PLUGIN_DIR, "memory_store.json")
     if not os.path.exists(MEMORY_FILE) and os.path.exists(old_mem):
         shutil.copy2(old_mem, MEMORY_FILE)
@@ -77,6 +82,7 @@ def _ensure_data_dir() -> None:
 
 
 async def _auto_backup(source_path: str, label: str) -> Optional[str]:
+    """Async copy file to backup dir with timestamp."""
     if not os.path.exists(source_path):
         return None
     ts = datetime.now(CST).strftime("%Y%m%d_%H%M%S")
@@ -91,9 +97,11 @@ async def _auto_backup(source_path: str, label: str) -> Optional[str]:
 
 
 async def _auto_rotate_backups(source_path: str, keep: int = 5) -> None:
+    """轮转清理：对同一 base name 的备份文件，只保留最近 `keep` 份。"""
     fname = os.path.basename(source_path)
     base, _ = os.path.splitext(fname)
     prefix = f"{base}_"
+
     def _clean():
         candidates = []
         for entry in os.scandir(BACKUP_DIR):
@@ -103,10 +111,12 @@ async def _auto_rotate_backups(source_path: str, keep: int = 5) -> None:
         for path, _ in candidates[keep:]:
             os.remove(path)
             logger.debug(f"[GE] rotated out: {os.path.basename(path)}")
+
     await asyncio.get_event_loop().run_in_executor(None, _clean)
 
 
 async def _backup_all(label: str = "evo") -> None:
+    """Async backup all critical data files."""
     tasks = []
     for path in [DB_PATH, EVO_STATS_FILE, MEMORY_FILE]:
         if os.path.exists(path):
@@ -116,11 +126,14 @@ async def _backup_all(label: str = "evo") -> None:
 
 
 class MemoryStore:
+    """JSON file-backed memory store (v1.0.6: read-only archive, new data via MemoryManager/SQLite)."""
+
     def __init__(self, file_path: str):
         self.file_path = file_path
         self._memories: Dict[str, dict] = {}
         self._counter = 0
         self._load()
+
     def _load(self):
         if os.path.exists(self.file_path):
             try:
@@ -133,37 +146,50 @@ class MemoryStore:
                 logger.warning("[GE] memory file corrupt, starting fresh")
                 self._memories = {}
                 self._counter = 0
+
     def _save(self):
         with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump({"memories": self._memories, "counter": self._counter}, f, ensure_ascii=False, indent=2)
+
     async def _save_async(self):
         await asyncio.get_event_loop().run_in_executor(None, self._save)
+
     async def add(self, entry: dict) -> str:
         logger.warning("[GE] MemoryStore.add() deprecated (v1.0.6)")
         return entry.get("id", "")
+
     def get(self, entry_id: str) -> Optional[dict]:
         return self._memories.get(entry_id)
+
     def list_all(self) -> List[dict]:
         return list(self._memories.values())
+
     async def update(self, entry_id: str, updates: dict):
         logger.warning(f"[GE] MemoryStore.update() deprecated (v1.0.6), skipping {entry_id}")
+
     async def delete(self, entry_id: str):
         logger.warning(f"[GE] MemoryStore.delete() deprecated (v1.0.6), skipping {entry_id}")
+
     def count(self) -> int:
         return len(self._memories)
 
 
 class VectorStore:
+    """ChromaDB-based vector store."""
+
     def __init__(self, persist_dir: str):
         self.persist_dir = persist_dir
         self._client = None
         self._collection = None
         self._embed_fn = None
+
     @property
     def ready(self) -> bool:
         return self._collection is not None and self._embed_fn is not None
+
     def set_embed_fn(self, fn):
         self._embed_fn = fn
+
     def init_collection(self):
         try:
             import chromadb
@@ -175,14 +201,20 @@ class VectorStore:
             logger.info(f"[GE] ChromaDB collection ready ({self._collection.count()} vectors)")
         except Exception as e:
             logger.error(f"[GE] ChromaDB init failed: {e}")
+
     async def add(self, entry_id: str, text: str, metadata: Optional[dict] = None):
         if not self.ready:
             return
         try:
             vec = await self._embed_fn([text])
-            self._collection.add(ids=[entry_id], embeddings=vec, metadatas=[metadata if metadata else {"source": "ge"}])
+            self._collection.add(
+                ids=[entry_id],
+                embeddings=vec,
+                metadatas=[metadata if metadata else {"source": "ge"}],
+            )
         except Exception as e:
             logger.warning(f"[GE] vector add failed ({entry_id}): {e}")
+
     async def search(self, query: str, top_k: int = 5) -> List[dict]:
         if not self.ready:
             return []
@@ -192,19 +224,26 @@ class VectorStore:
             out = []
             if results and results["ids"] and results["ids"][0]:
                 for i, eid in enumerate(results["ids"][0]):
-                    out.append({"id": eid, "distance": results["distances"][0][i] if results.get("distances") else None, "metadata": results["metadatas"][0][i] if results.get("metadatas") else {}})
+                    out.append({
+                        "id": eid,
+                        "distance": results["distances"][0][i] if results.get("distances") else None,
+                        "metadata": results["metadatas"][0][i] if results.get("metadatas") else {},
+                    })
             return out
         except Exception as e:
             logger.warning(f"[GE] vector search failed: {e}")
             return []
+
     def count(self) -> int:
         return self._collection.count() if self._collection else 0
+
     async def delete(self, entry_id: str):
         if self.ready:
             try:
                 self._collection.delete(ids=[entry_id])
             except Exception:
                 pass
+
     async def load_vectors_from_store(self, store: MemoryStore):
         if not self.ready:
             return
@@ -252,10 +291,20 @@ def _entry_to_text(entry: "MemoryEntry") -> str:
 
 
 class EvolutionStats:
+    """Evolution statistics persistence."""
+
     def __init__(self, file_path: str):
         self.file_path = file_path
-        self._stats: Dict[str, Any] = {"total_evolutions": 0, "total_insights": 0, "total_consolidations": 0, "total_evictions": 0, "last_evolution_at": None, "last_evolution_duration_sec": None}
+        self._stats: Dict[str, Any] = {
+            "total_evolutions": 0,
+            "total_insights": 0,
+            "total_consolidations": 0,
+            "total_evictions": 0,
+            "last_evolution_at": None,
+            "last_evolution_duration_sec": None,
+        }
         self._load()
+
     def _load(self):
         if os.path.exists(self.file_path):
             try:
@@ -263,33 +312,60 @@ class EvolutionStats:
                     self._stats.update(json.load(f))
             except Exception:
                 pass
+
     def _save(self):
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
         with open(self.file_path, "w", encoding="utf-8") as f:
             json.dump(self._stats, f, ensure_ascii=False, indent=2)
+
     def increment(self, key: str, amount: int = 1):
         self._stats[key] = self._stats.get(key, 0) + amount
         self._save()
+
     def set(self, key: str, value):
         self._stats[key] = value
         self._save()
+
     def get_summary(self) -> dict:
         return dict(self._stats)
 
 
-CATEGORIES = ["general", "debugging", "deployment", "coding", "configuration", "security", "insight", "consolidated_rule"]
+CATEGORIES = [
+    "general", "debugging", "deployment", "coding",
+    "configuration", "security", "insight", "consolidated_rule",
+]
+
 MEMORY_TYPES = ["procedural", "declarative", "episodic"]
 
 
 async def classify_memory(question: str, content: str, llm_call) -> dict:
-    prompt = ("你是一个记忆分类助手。请分析以下记忆，返回 JSON。\n\n" f"问题: {question}\n" f"内容: {content}\n\n" "请返回严格 JSON 格式：\n" "{\n" '  "category": "分类标签",\n' '  "memory_type": "procedural/declarative/episodic",\n' '  "tags": ["标签1", "标签2"]\n' "}\n\n" "分类标签可选：" + ", ".join(CATEGORIES) + "\n" "记忆类型：\n" "- procedural: 操作步骤、命令、流程\n" "- declarative: 事实、知识、信息\n" "- episodic: 事件、经历、对话记录\n")
+    prompt = (
+        "你是一个记忆分类助手。请分析以下记忆，返回 JSON。\n\n"
+        f"问题: {question}\n"
+        f"内容: {content}\n\n"
+        "请返回严格 JSON 格式：\n"
+        "{\n"
+        '  "category": "分类标签",\n'
+        '  "memory_type": "procedural/declarative/episodic",\n'
+        '  "tags": ["标签1", "标签2"]\n'
+        "}\n\n"
+        "分类标签可选：" + ", ".join(CATEGORIES) + "\n"
+        "记忆类型：\n"
+        "- procedural: 操作步骤、命令、流程\n"
+        "- declarative: 事实、知识、信息\n"
+        "- episodic: 事件、经历、对话记录\n"
+    )
     try:
         resp = await llm_call(prompt)
         json_start = resp.find("{")
         json_end = resp.rfind("}") + 1
         if json_start != -1 and json_end > json_start:
             parsed = json.loads(resp[json_start:json_end])
-            return {"category": parsed.get("category", "general"), "memory_type": parsed.get("memory_type", "declarative"), "tags": parsed.get("tags", [])}
+            return {
+                "category": parsed.get("category", "general"),
+                "memory_type": parsed.get("memory_type", "declarative"),
+                "tags": parsed.get("tags", []),
+            }
     except Exception:
         pass
     return {"category": "general", "memory_type": "declarative", "tags": []}
@@ -321,7 +397,12 @@ class GloriousEvolutionPlugin(Star):
         global _plugin_cache
         _plugin_cache = self
         inject_plugin(self)
-        self.context.add_llm_tools(StoreMemoryTool(), SearchMemoryTool(), UpdateWinRateTool(), EvictMemoriesTool(), GetEvolutionStatsTool(), TriggerEvolutionTool(), BuildPlanTool(), JudgeReplanTool(), BuildReplanTool(), RunAgentLoopTool())
+        self.context.add_llm_tools(
+            StoreMemoryTool(), SearchMemoryTool(), UpdateWinRateTool(),
+            EvictMemoriesTool(), GetEvolutionStatsTool(), TriggerEvolutionTool(),
+            BuildPlanTool(), JudgeReplanTool(), BuildReplanTool(),
+            RunAgentLoopTool(),
+        )
         logger.info(f"[Glorious Evolution] v{VERSION} init (data: {DATA_DIR})")
 
     @staticmethod
@@ -348,7 +429,8 @@ class GloriousEvolutionPlugin(Star):
             logger.info(f"[GE] EmbeddingProvider ready (instant): {pid} (dim={dim})")
             await self._setup_embed_fn_and_collection()
             return
-        if (not hasattr(self, '_embedding_retry_task') or self._embedding_retry_task is None or self._embedding_retry_task.done()):
+        if (not hasattr(self, '_embedding_retry_task') or
+                self._embedding_retry_task is None or self._embedding_retry_task.done()):
             logger.info("[GE] EmbeddingProvider not ready, starting background retry...")
             self._embedding_retry_task = asyncio.create_task(self._retry_init_embedding())
 
@@ -397,7 +479,8 @@ class GloriousEvolutionPlugin(Star):
             return
         if self._try_setup_classifier():
             return
-        if (not hasattr(self, '_classifier_retry_task') or self._classifier_retry_task is None or self._classifier_retry_task.done()):
+        if (not hasattr(self, '_classifier_retry_task') or
+                self._classifier_retry_task is None or self._classifier_retry_task.done()):
             logger.info("[GE] classifier LLM not ready, starting background retry...")
             self._classifier_retry_task = asyncio.create_task(self._retry_init_classifier())
 
@@ -411,7 +494,10 @@ class GloriousEvolutionPlugin(Star):
                     continue
                 pid = getattr(p, 'id', str(p))
                 async def llm_call(prompt, _provider=p):
-                    req = ProviderRequest(prompt=prompt, image_urls=[], urls=[], func_tool=None, session=None, context_compress=False)
+                    req = ProviderRequest(
+                        prompt=prompt, image_urls=[], urls=[],
+                        func_tool=None, session=None, context_compress=False,
+                    )
                     resp = await _provider.text_chat(req)
                     return resp.completion_text if resp else ""
                 self._classifier_llm = llm_call
@@ -419,7 +505,9 @@ class GloriousEvolutionPlugin(Star):
                 async def _classify_mem(q, c):
                     classification = await classify_memory(q, c, llm_call)
                     return classification.get("category", "general")
-                self._classify_task = asyncio.ensure_future(self._memory_mgr.set_classify_func(_classify_mem))
+                self._classify_task = asyncio.ensure_future(
+                    self._memory_mgr.set_classify_func(_classify_mem)
+                )
                 logger.info("[GE] MemoryManager classify hook injected")
                 return True
             logger.warning("[GE] get_all_providers returned list but no text_chat")
@@ -507,7 +595,11 @@ class GloriousEvolutionPlugin(Star):
                 logger.error(f"[GE] evolution loop error: {e}")
             await asyncio.sleep(INTERVAL_SECONDS)
 
-    REQUIRED_FILES = ["main.py", "__init__.py", "models.py", "storage.py", "memory_manager.py", "reasoning_engine.py", "evolution_task.py", "tool_sanitizer.py", "metadata.yaml", "_conf_schema.json"]
+    REQUIRED_FILES = [
+        "main.py", "__init__.py", "models.py", "storage.py",
+        "memory_manager.py", "reasoning_engine.py", "evolution_task.py",
+        "tool_sanitizer.py", "metadata.yaml", "_conf_schema.json",
+    ]
 
     async def _health_check_loop(self) -> None:
         CHECK_INTERVAL = 30 * 60
@@ -530,6 +622,21 @@ class GloriousEvolutionPlugin(Star):
                         conn.close()
                     except Exception as e:
                         violations.append(f"DB_CORRUPT: {e}")
+                global _plugin_cache
+                if _plugin_cache is None:
+                    try:
+                        from astrbot.api.star import GlobalStarMap
+                        star_map = GlobalStarMap()
+                        found = False
+                        for v in star_map.star_map.values():
+                            if isinstance(v, GloriousEvolutionPlugin):
+                                _plugin_cache = v
+                                found = True
+                                break
+                        if not found:
+                            violations.append("UNREGISTERED: plugin not in star_map")
+                    except Exception:
+                        violations.append("UNREGISTERED: GlobalStarMap inaccessible")
                 if violations:
                     logger.error(f"[GE] HEALTH CHECK FAILED: {'; '.join(violations)}")
                     for v in violations:
@@ -578,7 +685,10 @@ class GloriousEvolutionPlugin(Star):
         start_ts = time.time()
         logger.info("[GE] evolution cycle started (EvolutionEngine)...")
         try:
-            result = await asyncio.wait_for(self._evo_engine.run_evolution_cycle(), timeout=self._evo_engine.CYCLE_TIMEOUT)
+            result = await asyncio.wait_for(
+                self._evo_engine.run_evolution_cycle(),
+                timeout=self._evo_engine.CYCLE_TIMEOUT,
+            )
         except asyncio.TimeoutError:
             logger.error("[GE] EvolutionEngine timeout (300s), skip")
             return
@@ -592,7 +702,13 @@ class GloriousEvolutionPlugin(Star):
         self.evo_stats.increment("total_evictions", result.get("evicted", 0))
         self.evo_stats.set("last_evolution_at", datetime.now(CST).isoformat())
         self.evo_stats.set("last_evolution_duration_sec", round(duration, 2))
-        logger.info(f"[GE] evolution done: consolidated={result.get('consolidated', 0)} insights={result.get('insights', 0)} evicted={result.get('evicted', 0)} duration={duration:.1f}s")
+        logger.info(
+            f"[GE] evolution done: "
+            f"consolidated={result.get('consolidated', 0)} "
+            f"insights={result.get('insights', 0)} "
+            f"evicted={result.get('evicted', 0)} "
+            f"duration={duration:.1f}s"
+        )
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -619,24 +735,35 @@ class GloriousEvolutionPlugin(Star):
         await self._inject_relevant_memories(req)
 
     async def _inject_relevant_memories(self, req: ProviderRequest) -> None:
+        """v1.0.14: 自动注入相关记忆 + 蒸馏规则，并涨 usage_count（不动 win_rate）。"""
         if not self._memory_mgr:
             return
         prompt = getattr(req, "prompt", "")
         if not isinstance(prompt, str) or len(prompt) <= 5:
             return
+
         logger.info(f"[GE] inject start: prompt_len={len(prompt)}")
+
+        # 1. 向量检索
         try:
-            entries = await self._memory_mgr.retrieve_relevant_memories(query=prompt, top_k=5)
+            entries = await self._memory_mgr.retrieve_relevant_memories(
+                query=prompt, top_k=5
+            )
         except Exception as e:
             logger.debug(f"[GE] memory retrieval error: {e}")
             entries = []
+
+        # 2. 蒸馏规则
         distilled_rules: List[str] = []
         try:
             rules = await self._storage.get_distilled_rules(min_win_rate=0.7, limit=3)
             distilled_rules = [r["content"][:120] for r in rules if r.get("content")]
         except Exception:
             pass
+
         logger.info(f"[GE] retrieved {len(entries)} entries, {len(distilled_rules)} rules")
+
+        # 3. 过滤 + 构建注入块
         mem_lines = []
         injected_ids: List[str] = []
         for e in entries:
@@ -644,36 +771,50 @@ class GloriousEvolutionPlugin(Star):
                 continue
             mem_lines.append(f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}")
             injected_ids.append(e.id)
+
         logger.info(f"[GE] after filter: {len(injected_ids)} to inject")
+
         rule_lines = [f"- {r}" for r in distilled_rules]
+
         injection_parts = []
         if mem_lines:
             injection_parts.append("[相关记忆]\n" + "\n".join(mem_lines))
         if rule_lines:
             injection_parts.append("[蒸馏规则 (高胜率)]\n" + "\n".join(rule_lines))
+
         if not injection_parts:
             return
+
         injection = "\n\n" + "\n\n".join(injection_parts)
         sp = getattr(req, "system_prompt", None)
         if isinstance(sp, str):
             req.system_prompt = sp + injection
         else:
             req.system_prompt = injection
+
+        # 4. usage_count +1
         for eid in injected_ids:
             try:
                 await self._memory_mgr.increment_usage(eid)
             except Exception:
                 pass
+
+        # 5. ID 透传给 Agent Loop judge
         try:
             prev = getattr(req, "_ge_injected_mem_ids", None) or []
             req._ge_injected_mem_ids = prev + injected_ids
         except Exception:
             pass
+
         logger.info(f"[GE] memory injection done: {len(injected_ids)} memories, {len(distilled_rules)} rules")
 
     @staticmethod
     def _detect_last_tool(prompt: str) -> Optional[str]:
-        patterns = [r'Tool Result \(([^)]+)\)', r'🔧 Tool:\s*(\S+)', r'"name":\s*"([^"]+)"']
+        patterns = [
+            r'Tool Result \(([^)]+)\)',
+            r'🔧 Tool:\s*(\S+)',
+            r'"name":\s*"([^"]+)"',
+        ]
         for pat in patterns:
             matches = list(re.finditer(pat, prompt))
             if matches:
@@ -687,5 +828,10 @@ class GloriousEvolutionPlugin(Star):
         win_rate = round(mgr_stats.get("avg_win_rate", 0) * 100) if mems else 0
         vec_ready = "✅" if mgr_stats.get("embedding_ready") else "⏳"
         cls_ready = "✅" if self._classifier_llm else "⏳"
-        msg = (f"📊 Glorious Evolution v{VERSION}\n" f"📚 memories: {mems} | 📈 win_rate: {win_rate}% | 🧠 vector: {vec_ready} | 🏷️ classifier: {cls_ready}\n" f"💾 data: {DATA_DIR}\n" f"🧬 Full MIA: Memory + Reasoning + Evolution + Classification ✅")
+        msg = (
+            f"📊 Glorious Evolution v{VERSION}\n"
+            f"📚 memories: {mems} | 📈 win_rate: {win_rate}% | 🧠 vector: {vec_ready} | 🏷️ classifier: {cls_ready}\n"
+            f"💾 data: {DATA_DIR}\n"
+            f"🧬 Full MIA: Memory + Reasoning + Evolution + Classification ✅"
+        )
         yield event.plain_result(msg)
