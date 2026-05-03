@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.18 - on_agent_begin 钩子：在 Agent 启动时向 system prompt 注入记忆
+v1.0.19 - on_llm_request 改用 event.message_str 做 query，提升检索相关性
 """
 
 import asyncio
@@ -50,7 +50,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -392,7 +392,7 @@ class GloriousEvolutionPlugin(Star):
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
         self._evo_engine = EvolutionEngine(self._memory_mgr, self._reasoning_engine, context)
-        self._evo_engine.set_distillation_config(self.config.get("distillation", {}))
+        self._evo_engine.set_distillation_config self.config.get("distillation", {})
         self._agent_loop = AgentLoop(self._reasoning_engine, self._memory_mgr)
         global _plugin_cache
         _plugin_cache = self
@@ -715,15 +715,18 @@ class GloriousEvolutionPlugin(Star):
     @filter.on_agent_begin()
     async def on_agent_begin(self, event: AstrMessageEvent, run_context) -> None:
         """v1.0.18: 用 on_agent_begin 替代 on_llm_request 做记忆注入"""
+        logger.info("[GE] on_agent_begin FIRED ✅")
         await self._inject_relevant_memories_v2(run_context)
 
     async def _inject_relevant_memories_v2(self, run_context) -> None:
         """v1.0.18: 从 run_context.context.event.message_str 取 query，
         检索相关记忆并追加到 run_context.messages 中 role=system 的消息。"""
         if not self._memory_mgr:
+            logger.warning("[GE] _inject_relevant_memories_v2: MemoryManager not ready")
             return
 
         query = getattr(run_context.context.event, "message_str", "")
+        logger.info(f"[GE] _inject_relevant_memories_v2: query='{query[:80]}' len={len(query)}")
         if not query or len(query) <= 5:
             return
 
@@ -748,8 +751,10 @@ class GloriousEvolutionPlugin(Star):
         mem_lines = []
         injected_ids: List[str] = []
         for e in entries:
-            if e.win_rate > 0 and e.win_rate < 0.2:
-                continue
+            # v1.0.18-patch: 关闭过滤，让所有检索结果都能注入
+            # 之前 < 0.2 门槛把 pending(win=0) 记忆也错误跳过了
+            # if e.win_rate > 0 and e.win_rate < 0.2:
+            #     continue
             mem_lines.append(f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}")
             injected_ids.append(e.id)
 
@@ -812,22 +817,22 @@ class GloriousEvolutionPlugin(Star):
                                 msg["content"] = sanitize_content(content)
             except Exception as e:
                 logger.debug(f"[GE] ToolCallHook sanitize error (silenced): {e}")
-        await self._inject_relevant_memories(req)
+        await self._inject_relevant_memories(event, req)
 
-    async def _inject_relevant_memories(self, req: ProviderRequest) -> None:
-        """v1.0.14: 自动注入相关记忆 + 蒸馏规则，并涨 usage_count（不动 win_rate）。"""
+    async def _inject_relevant_memories(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        """v1.0.19: query 改为 event.message_str（用户原始消息），减少语义噪音。"""
         if not self._memory_mgr:
             return
-        prompt = getattr(req, "prompt", "")
-        if not isinstance(prompt, str) or len(prompt) <= 5:
-            return
 
-        logger.error("[GE] inject start: prompt_len={}".format(len(prompt)))
+        query = getattr(event, "message_str", "")
+        logger.info("[GE] inject start: query='{}'".format(query[:80] if query else ""))
+        if not query or len(query) <= 5:
+            return
 
         # 1. 向量检索
         try:
             entries = await self._memory_mgr.retrieve_relevant_memories(
-                query=prompt, top_k=5
+                query=query, top_k=5
             )
         except Exception as e:
             logger.debug(f"[GE] memory retrieval error: {e}")
@@ -843,16 +848,12 @@ class GloriousEvolutionPlugin(Star):
 
         logger.info(f"[GE] retrieved {len(entries)} entries, {len(distilled_rules)} rules")
 
-        # 3. 过滤 + 构建注入块
+        # 3. 构建注入块（v1.0.19: 去掉 win_rate 门槛，让所有检索结果都能注入）
         mem_lines = []
         injected_ids: List[str] = []
         for e in entries:
-            if e.win_rate > 0 and e.win_rate < 0.2:
-                continue
             mem_lines.append(f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}")
             injected_ids.append(e.id)
-
-        logger.info(f"[GE] after filter: {len(injected_ids)} to inject")
 
         rule_lines = [f"- {r}" for r in distilled_rules]
 
