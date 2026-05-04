@@ -1,0 +1,17 @@
+# Data files (should not be committed)
+evolution.db
+evolution.db.backup
+chroma_db/
+memory_store.json
+evolution_stats.json
+
+# Backups
+backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
