@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.20 - win_rate 初始值 0.5 + eviction 增加 PENDING 保护
+v1.0.22 - 修复 Internal Agent 模式下记忆注入失效（query fallback 链）
 """
 
 import asyncio
@@ -50,7 +50,7 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.20"
+VERSION = "1.0.22"  # fix: query fallback chain for Internal Agent mode
 DEFAULT_EVO_INTERVAL_HOURS = 6
 
 logger = logging.getLogger("GloriousEvolution")
@@ -553,32 +553,33 @@ class GloriousEvolutionPlugin(Star):
             logger.error(f"[GE] delayed_scan_and_index error: {e}", exc_info=True)
 
     async def terminate(self) -> None:
+        """v1.0.21: 取消所有后台任务，防止泄漏。"""
         logger.info("[GE] final backup before shutdown...")
         try:
             await _backup_all(label="shutdown")
         except Exception as e:
             logger.warning(f"[GE] shutdown backup failed: {e}")
-        if self._evo_task:
-            self._evo_task.cancel()
-            try:
-                await self._evo_task
-            except asyncio.CancelledError:
-                pass
-            self._evo_task = None
-        if self._classify_task and not self._classify_task.done():
-            self._classify_task.cancel()
-            try:
-                await asyncio.shield(self._classify_task)
-            except asyncio.CancelledError:
-                pass
-            self._classify_task = None
-        if self._health_check_task and not self._health_check_task.done():
-            self._health_check_task.cancel()
-            try:
-                await self._health_check_task
-            except asyncio.CancelledError:
-                pass
-            self._health_check_task = None
+
+        # 取消所有后台任务
+        tasks_to_cancel = [
+            ("_evo_task", self._evo_task),
+            ("_health_check_task", self._health_check_task),
+            ("_embedding_retry_task", self._embedding_retry_task),
+            ("_classifier_retry_task", self._classifier_retry_task),
+            ("_classify_task", self._classify_task),
+            ("_agent_loop_task", self._agent_loop_task),
+        ]
+        for name, task in tasks_to_cancel:
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                setattr(self, name, None)
+        logger.info("[GE] all background tasks cancelled")
 
     async def _evolution_loop(self) -> None:
         INTERVAL_SECONDS = 360 * 60
@@ -602,6 +603,7 @@ class GloriousEvolutionPlugin(Star):
     ]
 
     async def _health_check_loop(self) -> None:
+        """v1.0.21: 移除自动创建空文件逻辑 — 缺失文件应告警而非掩盖。"""
         CHECK_INTERVAL = 30 * 60
         logger.info("[GE] health check loop ready (interval: 30 min)")
         await asyncio.sleep(CHECK_INTERVAL)
@@ -612,8 +614,10 @@ class GloriousEvolutionPlugin(Star):
                     fpath = os.path.join(PLUGIN_DIR, fname)
                     if not os.path.exists(fpath):
                         violations.append(f"MISSING: {fname}")
+                        logger.error(f"[GE] HEALTH CHECK: required file missing — {fname}")
                     elif os.path.getsize(fpath) == 0:
                         violations.append(f"EMPTY: {fname}")
+                        logger.error(f"[GE] HEALTH CHECK: required file empty — {fname}")
                 if os.path.exists(DB_PATH):
                     try:
                         import sqlite3
@@ -622,6 +626,7 @@ class GloriousEvolutionPlugin(Star):
                         conn.close()
                     except Exception as e:
                         violations.append(f"DB_CORRUPT: {e}")
+                        logger.error(f"[GE] HEALTH CHECK: database corrupted — {e}")
                 global _plugin_cache
                 if _plugin_cache is None:
                     try:
@@ -635,18 +640,12 @@ class GloriousEvolutionPlugin(Star):
                                 break
                         if not found:
                             violations.append("UNREGISTERED: plugin not in star_map")
+                            logger.error("[GE] HEALTH CHECK: plugin not registered in star_map")
                     except Exception:
                         violations.append("UNREGISTERED: GlobalStarMap inaccessible")
+                        logger.error("[GE] HEALTH CHECK: GlobalStarMap inaccessible")
                 if violations:
-                    logger.error(f"[GE] HEALTH CHECK FAILED: {'; '.join(violations)}")
-                    for v in violations:
-                        if v.startswith("MISSING:"):
-                            fname = v.split(": ", 1)[1]
-                            fpath = os.path.join(PLUGIN_DIR, fname)
-                            if not os.path.exists(fpath):
-                                with open(fpath, "w") as f:
-                                    f.write("")
-                                logger.warning(f"[GE] auto-repair: created empty {fname}")
+                    logger.error(f"[GE] HEALTH CHECK FAILED ({len(violations)} violations)")
                 else:
                     logger.debug("[GE] health check passed")
             except asyncio.CancelledError:
@@ -732,22 +731,37 @@ class GloriousEvolutionPlugin(Star):
                                 msg["content"] = sanitize_content(content)
             except Exception as e:
                 logger.debug(f"[GE] ToolCallHook sanitize error (silenced): {e}")
-        await self._inject_relevant_memories(req)
+        await self._inject_relevant_memories(event, req)
 
-    async def _inject_relevant_memories(self, req: ProviderRequest) -> None:
-        """v1.0.14: 自动注入相关记忆 + 蒸馏规则，并涨 usage_count（不动 win_rate）。"""
+    async def _inject_relevant_memories(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
+        """v1.0.14: 自动注入相关记忆 + 蒸馏规则，并涨 usage_count（不动 win_rate）。
+        v1.0.22: query fallback 链修复 Internal Agent 模式下 req.prompt 为空的问题。"""
         if not self._memory_mgr:
             return
-        prompt = getattr(req, "prompt", "")
-        if not isinstance(prompt, str) or len(prompt) <= 5:
+
+        # query fallback: req.prompt → event.message_str → req.contexts 最后一条 user msg
+        query = getattr(req, "prompt", "") or ""
+        source = "req.prompt"
+        if len(query) <= 5:
+            query = getattr(event, "message_str", "") or ""
+            source = "event.message_str"
+        if len(query) <= 5:
+            for msg in reversed(req.contexts or []):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 5:
+                        query = content
+                        source = "req.contexts[user]"
+                        break
+        if len(query) <= 5:
             return
 
-        logger.info(f"[GE] inject start: prompt_len={len(prompt)}")
+        logger.info(f"[GE] inject start: query_len={len(query)}, source={source}")
 
         # 1. 向量检索
         try:
             entries = await self._memory_mgr.retrieve_relevant_memories(
-                query=prompt, top_k=5
+                query=query, top_k=5
             )
         except Exception as e:
             logger.debug(f"[GE] memory retrieval error: {e}")
