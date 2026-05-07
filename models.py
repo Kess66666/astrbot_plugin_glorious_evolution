@@ -5,8 +5,6 @@ MIA 风格的记忆条目定义 + Agent Loop 状态机
 v1.0.12: AgentLoopState 新增 used_memory_ids / used_neg_memory_ids
 v1.0.13: AgentLoopState 新增 used_memory_snippets（id→内容摘要），
          支撑 judge 阶段按记忆粒度评价贡献度
-v1.0.20: win_rate 默认值从 0.0 改为 0.5（中性值），
-         避免新记忆被误判为低质量
 """
 
 import json
