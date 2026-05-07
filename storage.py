@@ -8,15 +8,11 @@ v1.0.11 修复:
 - update_entry key 白名单校验，防 SQL 注入
 - 删除废弃的 storage.update_win_rate()（统一走 MemoryManager.update_win_rate）
 - insert_entry/add_entry 返回值语义修正
-v1.0.21 修复:
-- _sanitize_fts5_query 改用 AND 连接 terms（OR 过于宽泛）
-- get_all_memories 默认 limit 统一为 10000
 """
 
 import asyncio
 import json
 import os
-import re
 import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -107,9 +103,47 @@ class Storage:
                     updated_at TEXT NOT NULL
                 );
             """)
+            # ── Schema Migration ──
+            self._run_migrations(conn)
+
             conn.commit()
         finally:
             conn.close()
+
+    # ── Schema Migration ──
+
+    _MIGRATIONS: Dict[int, str] = {
+        # version 0→1: 初始版本，标记当前 schema 为 v1
+        # (所有表已在上方 CREATE TABLE IF NOT EXISTS 中创建)
+        1: "-- baseline: mark schema as v1",
+        # ── 未来迁移在此追加 ──
+        # 2: "ALTER TABLE memories ADD COLUMN importance INTEGER NOT NULL DEFAULT 50;",
+        # 3: "ALTER TABLE memories ADD COLUMN memory_scope TEXT NOT NULL DEFAULT 'public';",
+    }
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """按 user_version PRAGMA 顺序执行未完成的迁移。"""
+        current_version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+        target_version = max(self._MIGRATIONS.keys())
+
+        if current_version >= target_version:
+            logger.debug(f"[GE] Schema v{current_version}, 无需迁移")
+            return
+
+        for version in sorted(self._MIGRATIONS.keys()):
+            if version <= current_version:
+                continue
+            sql = self._MIGRATIONS[version]
+            logger.info(f"[GE] Schema migration v{current_version}→v{version}: {sql[:80]}")
+            if sql.strip().startswith("--"):
+                # 纯注释迁移（如 baseline），仅更新版本号
+                pass
+            else:
+                conn.executescript(sql)
+            conn.execute(f"PRAGMA user_version = {version}")
+            current_version = version
+
+        logger.info(f"[GE] Schema migration 完成: v{current_version}")
 
     # ── ID 计数器恢复 ──
 
@@ -245,14 +279,35 @@ class Storage:
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
-        """净化 FTS5 查询字符串，避免特殊字符触发语法错误。"""
+        """净化 FTS5 查询，用 jieba 分词后 OR 拼接，匹配 FTS5 jieba tokenizer 的索引粒度。"""
+        import re
+        try:
+            import jieba
+        except ImportError:
+            jieba = None
+
         safe = re.sub(r'[^\w\u4e00-\u9fff]', ' ', query)
         if not safe.strip():
             return '""'
-        terms = safe.split()
-        if not terms:
-            return '""'
-        return " AND ".join(terms)
+
+        if jieba is not None:
+            tokens = jieba.cut_for_search(safe)
+            terms = []
+            for t in tokens:
+                t = t.strip()
+                if len(t) <= 1:
+                    continue
+                t = re.sub(r'["*()]', '', t)
+                if t:
+                    terms.append(t)
+            if not terms:
+                return '""'
+            return " OR ".join(terms)
+        else:
+            terms = safe.split()
+            if not terms:
+                return '""'
+            return " OR ".join(terms)
 
     async def search_entries(
         self,
@@ -296,7 +351,7 @@ class Storage:
 
     # ── 批量读取 ──
 
-    async def get_all_memories(self, limit: int = 10000) -> List[MemoryEntry]:
+    async def get_all_memories(self, limit: int = 1000) -> List[MemoryEntry]:
         """获取所有记忆条目"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
