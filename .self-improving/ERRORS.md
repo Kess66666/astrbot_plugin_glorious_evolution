@@ -1,0 +1,117 @@
+# Errors
+
+Command failures and integration errors.
+
+---
+
+## [ERR-20260504-003] on_llm_request 记忆注入从未生效
+
+**Logged**: 2026-05-04T21:12:00+08:00
+**Priority**: critical
+**Status**: resolved (v1.0.22 三级 fallback + v1.0.28 能力感知路由)
+**Area**: core
+
+### Summary
+`_inject_relevant_memories(req)` 在 Internal Agent 模式下从未执行过注入逻辑，所有"记忆注入生效"的体感实际来自 LLM 主动调用 `store_memory`/`search_memory` Tool。
+
+### 根因
+AstrBot Internal Agent 模式下 `ProviderRequest.prompt = ""`（空字符串），用户消息通过 `req.contexts`（对话历史列表）传递。
+
+代码路径：
+- `astr_main_agent.py:1144-1145`: `req = ProviderRequest(); req.prompt = ""`
+- `main.py:741`: `if len(prompt) <= 5: return` — 空字符串直接 return
+
+### 历史
+1. **v1 期**: 用 `@filter.on_agent_begin()` → 该 hook 签名是 `(event, run_context)`，没有 `ProviderRequest`，无法注入
+2. **v2 期**: 改回 `@filter.on_llm_request()` → 有 `req` 但 `req.prompt=""`，guard 挡掉
+
+### 修复方向
+- **已采用方案（备选方案改进）**: `_inject_relevant_memories` 签名不变，query 提取使用三级 fallback 链: `req.prompt` → `event.message_str` → `req.contexts` 最后一条 user message
+- **v1.0.28**: 引入能力感知路由 — `has_tools = getattr(req, "func_tool", None) is not None`，按 agent 能力分流注入规则，无工具 agent 不注入 TOOL GATE
+- 参考: Angel Memory (kawayiYokami/astrbot_plugin_angel_memory) 把 event 传给下游，从 `event.message_str` 取 query
+
+### Resolution
+- **Resolved**: 2026-05-06 (v1.0.22 修复 query 提取 + v1.0.28 能力感知路由)
+- **Notes**: 单钩子方案足够，未采用两段式 on_agent_begin + on_llm_request
+
+### Metadata
+- Reproducible: yes (every LLM call in Internal Agent mode)
+- Related Files: main.py (L736-800)
+- Source: code review + Angel Memory 对比
+- See Also: LRN-20260504-002
+
+---
+
+## [ERR-20260502-002] dev_uninstall_plugin 误删插件（复发性）
+
+**Logged**: 2026-05-02T21:23:00+08:00
+**Priority**: critical
+**Status**: resolved (v1.0.23+，dev_uninstall_plugin 已从工具集移除)
+**Area**: infra
+
+### Summary
+door 多次使用 `dev_uninstall_plugin` 误删插件目录，导致未提交代码丢失。已 2 次记录在案。
+
+### 历史
+1. **2026-04-27**: v0.2.0 代码因"误操作"丢失，插件回退到 v0.1。此事件促成了 TOOLS.md 的创建。
+2. **2026-05-02**: 插件目录被删，未提交的 `set_distillation_config` 修复丢失，蒸馏管线功能崩溃（用户指出："这就是你错误删除插件带来的问题"）。
+
+### 根因
+- 混淆了 `dev_uninstall_plugin`（卸载）与"重载"的概念
+- TOOLS.md 已明文禁止，但未被严格遵循
+
+### Resolution
+- **Resolved**: 2026-05-02T21:25:00+08:00
+- **Fix**: 直接禁用 `dev_uninstall_plugin` 工具，从根上杜绝误用
+- **Notes**: 物理隔离 > 规则提醒，不再依赖 TOOLS.md 的"自觉遵守"
+
+### Metadata
+- Reproducible: yes
+- Related Files: TOOLS.md, REBUILD_PLAN.md, main.py
+- Source: conversation
+- Recurrence-Count: 2
+- First-Seen: 2026-04-27
+- Last-Seen: 2026-05-02
+- See Also: —
+
+---
+
+## [ERR-20260502-001] tool_sanitizer.py rf-string parse
+
+**Logged**: 2026-05-02T21:21:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: coding
+
+### Summary
+Python 3.12+ 无法解析 `tool_sanitizer.py:165` 的 rf-string：正则反斜杠 \s 在 f-string 表达式中触发语法错误，导致插件加载失败。
+
+### Error
+```
+SyntaxError: f-string expression part cannot include a backslash
+```
+位置：`tool_sanitizer.py` 第 164-165 行，4 处 rf-string 混用正则反斜杠模式。
+
+### Context
+- Glorious Evolution 插件 v1.0.16 加载时崩溃
+- Claude 定位到 `tool_sanitizer.py` 第 165 行 `rf"('{key_pattern_str}')\s*:\s*'([^']+)'"` 
+- 同类错误此前在 `reasoning_engine.py` 出现过（0dcac24 修复）
+
+### Suggested Fix
+4 处 rf-string 模式全部改为字符串变量拼接：
+- `_pat1` = `'"' + key + '")\\s*:\\s*"([^"]+)"'`
+- `_pat2` = `"'" + key + "')\\s*:\\s*'([^']+)'"`
+- `_pat3` = `'"' + key + '")\\s*:\\s*(\\S+)'`
+- `_cli_pat` = `'--(' + cli_key + ')=(\\S+)'`
+
+### Resolution
+- **Resolved**: 2026-05-02T21:18:00+08:00
+- **Commit/PR**: efd9eb6 on Kess66666/astrbot_plugin_glorious_evolution
+- **Notes**: 4 处 rf-string 正则模式均改为变量拼接，与 reasoning_engine.py 修法一致
+
+### Metadata
+- Reproducible: yes
+- Related Files: tool_sanitizer.py, reasoning_engine.py
+- See Also: LRN-20260502-001
+
+---
