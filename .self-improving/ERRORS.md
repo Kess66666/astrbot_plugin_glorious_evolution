@@ -4,6 +4,33 @@ Command failures and integration errors.
 
 ---
 
+## [ERR-20260507-001] 97% memories stuck in pending — 反馈闭环断裂
+
+**Logged**: 2026-05-07T23:00:00+08:00
+**Priority**: critical
+**Status**: resolved (v1.0.33 T-004 Soft Feedback)
+**Area**: core
+
+### Summary
+67/70 memories 停留在 pending 状态，win_rate 统计完全失效。根本原因是 feedback 闭环仅存在于 `run_agent_loop`（手动 Tool），普通对话路径（`on_llm_request → _inject_relevant_memories`）从未调用 `_record_feedback`。
+
+### 根因
+- `update_win_rate` Tool 需要 LLM 主动调用 → 几乎从不触发
+- `run_agent_loop` 的 judge 阶段会记录反馈，但普通对话不走这个路径
+- `_inject_relevant_memories` 注入了记忆但没有后续反馈步骤
+
+### Resolution
+- **Resolved**: 2026-05-07 (v1.0.33)
+- **Fix**: `_inject_relevant_memories` 出口加 `asyncio.create_task(self._soft_feedback(injected_ids))`
+- **Design**: 默认标记注入记忆为成功（远优于 97% pending 空转），零 Token 成本
+- **Verified**: pending 67→62, correct 5→10 在第一次对话中生效
+
+### Metadata
+- Reproducible: yes (every normal conversation)
+- Related Files: main.py (`_inject_relevant_memories`, `_soft_feedback`)
+- Source: conversation + Gemini 协作
+- See Also: MEM-20260507-114, LRN-20260507-001
+
 ## [ERR-20260504-003] on_llm_request 记忆注入从未生效
 
 **Logged**: 2026-05-04T21:12:00+08:00
