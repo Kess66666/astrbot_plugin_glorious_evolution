@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 光荣进化系统 (Glorious Evolution) — MIA 风格的智能记忆与自改进框架
-v1.0.31 — Unified Scoring: 三维评分 (cosine + win_rate + recency) + FTS 统一评分
+v2.0.0 — Unbiased Retrieval + Stratified Injection
 """
 
 import asyncio
@@ -51,8 +51,9 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "1.0.31"  # Unified Scoring: 三维评分 (cos+wr+rec), FTS统一, debug_recall
+VERSION = "2.0.0"  # v2.0: unbiased retrieval + stratified injection
 DEFAULT_EVO_INTERVAL_HOURS = 6
+DISABLE_AUTO_EVOLUTION = True  # v1.2: 止血模式 — 禁自动进化，仅手动 trigger
 
 logger = logging.getLogger("GloriousEvolution")
 
@@ -266,13 +267,13 @@ class VectorStore:
 def _mem_to_text(mem: dict) -> str:
     parts = []
     if mem.get("question"):
-        parts.append(f"Q: {mem['question']}")
+        parts.append(f"Q: {mem["question"]}")
     if mem.get("content"):
-        parts.append(f"A: {mem['content']}")
+        parts.append(f"A: {mem["content"]}")
     if mem.get("category"):
-        parts.append(f"Category: {mem['category']}")
+        parts.append(f"Category: {mem["category"]}")
     if mem.get("memory_type"):
-        parts.append(f"Type: {mem['memory_type']}")
+        parts.append(f"Type: {mem["memory_type"]}")
     return " | ".join(parts) if parts else json.dumps(mem, ensure_ascii=False)
 
 
@@ -336,7 +337,7 @@ CATEGORIES = [
     "configuration", "security", "insight", "consolidated_rule",
 ]
 
-MEMORY_TYPES = ["procedural", "declarative", "episodic"]
+MEMORY_TYPES = ["procedural", "declarative", "episodic", "consolidated_rule", "insight"]
 
 
 async def classify_memory(question: str, content: str, llm_call) -> dict:
@@ -347,14 +348,21 @@ async def classify_memory(question: str, content: str, llm_call) -> dict:
         "请返回严格 JSON 格式：\n"
         "{\n"
         '  "category": "分类标签",\n'
-        '  "memory_type": "procedural/declarative/episodic",\n'
+        '  "memory_type": "procedural/declarative/episodic/consolidated_rule/insight",\n'
         '  "tags": ["标签1", "标签2"]\n'
         "}\n\n"
         "分类标签可选：" + ", ".join(CATEGORIES) + "\n"
-        "记忆类型：\n"
-        "- procedural: 操作步骤、命令、流程\n"
-        "- declarative: 事实、知识、信息\n"
-        "- episodic: 事件、经历、对话记录\n"
+        "记忆类型（STRICT — 必须严格遵守以下定义）：\n"
+        "- procedural: 操作步骤、命令、流程（how to do something）\n"
+        "- declarative: 事实、知识、信息（what is something）\n"
+        "- episodic: 事件、经历、对话记录（what happened）\n"
+        "- insight: 对系统自身运行状况的分析诊断、胜率分布、病灶识别、改进建议（meta-analysis about the system itself）\n"
+        "- consolidated_rule: 从多次经验中提炼的固化规则、最佳实践、必须遵守的规范（distilled best practice）\n"
+        "\n"
+        "硬性规则：\n"
+        "- 如果内容是对系统自身状态的诊断分析或改进建议 → 必须是 insight，禁止归为 declarative\n"
+        "- 如果内容是从具体案例中提炼的通用规则 → 必须是 consolidated_rule\n"
+        "- 只有单纯的客观事实陈述（不含分析判断）才归为 declarative\n"
     )
     try:
         resp = await llm_call(prompt)
@@ -561,7 +569,6 @@ class GloriousEvolutionPlugin(Star):
         except Exception as e:
             logger.warning(f"[GE] shutdown backup failed: {e}")
 
-        # 取消所有后台任务
         tasks_to_cancel = [
             ("_evo_task", self._evo_task),
             ("_health_check_task", self._health_check_task),
@@ -584,6 +591,12 @@ class GloriousEvolutionPlugin(Star):
 
     async def _evolution_loop(self) -> None:
         INTERVAL_SECONDS = 360 * 60
+        if DISABLE_AUTO_EVOLUTION:
+            logger.info(
+                f"[GE] 🔒 v1.2 止血模式: DISABLE_AUTO_EVOLUTION=True, "
+                f"自动进化已关闭。使用 /trigger_evolution 手动执行。"
+            )
+            return
         logger.info(f"[GE] evolution loop ready, first cycle in {INTERVAL_SECONDS//60} min")
         await asyncio.sleep(INTERVAL_SECONDS)
         while True:
@@ -733,15 +746,64 @@ class GloriousEvolutionPlugin(Star):
                                 msg["content"] = sanitize_content(content)
             except Exception as e:
                 logger.debug(f"[GE] ToolCallHook sanitize error (silenced): {e}")
-        await self._inject_relevant_memories(event, req)
+        try:
+            await self._inject_relevant_memories(event, req)
+        except Exception as e:
+            logger.error(f"[GE] memory injection failed (non-fatal): {e}", exc_info=True)
+
+    @staticmethod
+    def _extract_session_constraints(contexts: list) -> list:
+        """v1.0.33: 扫描最近用户消息，直接提取约束——不依赖检索。
+        返回 [(level, text), ...]，level 为 HARD/SOFT。
+        """
+        constraints = []
+        recent = (contexts or [])[-6:]
+
+        HARD_PATTERNS = [
+            r'(?:不要|别|不许|禁止|stop\s|never\s)',
+            r'必须手动',
+            r'等我[^，。]{0,10}',
+            r"don'?t\s",
+            r'需要我手动',
+        ]
+        SOFT_PATTERNS = [
+            r'(?:最好|尽量|建议|prefer)\s*\S*',
+            r'我(?:更|比较)(?:喜欢|想)',
+            r'(?:please|pls)\s',
+        ]
+
+        for msg in recent:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            text = msg.get("content", "")
+            if not isinstance(text, str) or len(text) < 3:
+                continue
+
+            for pat in HARD_PATTERNS:
+                if re.search(pat, text, re.IGNORECASE):
+                    constraints.append(("HARD", text[:200]))
+                    break
+            else:
+                for pat in SOFT_PATTERNS:
+                    if re.search(pat, text, re.IGNORECASE):
+                        constraints.append(("SOFT", text[:200]))
+                        break
+
+        return constraints
 
     async def _inject_relevant_memories(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        """v1.0.14: 自动注入相关记忆 + 蒸馏规则，并涨 usage_count（不动 win_rate）。
-        v1.0.22: query fallback 链修复 Internal Agent 模式下 req.prompt 为空的问题。"""
+        """v2.0: Unbiased retrieval + Stratified injection.
+        Retrieval: pure cosine (cos=1.0, wr=0.0) → fair top-20.
+        Injection: 3 buckets — exploit (wr>0.7), explore (0.4~0.7), cold (<0.4) —
+        with shuffle for exposure fairness.
+        """
         if not self._memory_mgr:
             return
 
-        # query fallback: req.prompt → event.message_str → req.contexts 最后一条 user msg
+        session_constraints = self._extract_session_constraints(req.contexts or [])
+
         query = getattr(req, "prompt", "") or ""
         source = "req.prompt"
         if len(query) <= 5:
@@ -755,21 +817,19 @@ class GloriousEvolutionPlugin(Star):
                         query = content
                         source = "req.contexts[user]"
                         break
-        if len(query) <= 2:
+        if len(query) <= 2 and not session_constraints:
             return
 
-        logger.info(f"[GE] inject start: query_len={len(query)}, source={source}")
+        logger.info(f"[GE] inject start: query_len={len(query)}, source={source}, constraints={len(session_constraints)}")
 
-        # 1. 向量检索
         try:
             entries = await self._memory_mgr.retrieve_relevant_memories(
-                query=query, top_k=5
+                query=query, top_k=20
             )
         except Exception as e:
             logger.debug(f"[GE] memory retrieval error: {e}")
             entries = []
 
-        # 2. 蒸馏规则
         distilled_rules: List[str] = []
         try:
             rules = await self._storage.get_distilled_rules(min_win_rate=0.7, limit=3)
@@ -779,61 +839,57 @@ class GloriousEvolutionPlugin(Star):
 
         logger.info(f"[GE] retrieved {len(entries)} entries, {len(distilled_rules)} rules")
 
-        # 3. 可见度梯度分类（v1.0.29: 替代二进制过滤）
-        strong_lines: List[str] = []
-        normal_lines: List[str] = []
-        weak_lines: List[str] = []
-        exploration_lines: List[str] = []
-        injected_ids: List[str] = []
+        # v2.0: Stratified injection
+        exploit_entries = entries[:3]
+        remaining = entries[3:]
+        mid_wr = [e for e in remaining if 0.2 <= e.win_rate <= 0.7]
+        low_wr = [e for e in remaining if e.win_rate < 0.2]
 
-        for e in entries:
-            wr = e.win_rate
-            line = f"- [{e.category}] win={wr:.0%}: {e.content[:150]}"
+        explore_entries = mid_wr[:2]
+        cold_entries = low_wr[:1]
 
-            if wr > 0.7:
-                strong_lines.append(line)
-                injected_ids.append(e.id)
-            elif wr >= 0.2:
-                normal_lines.append(line)
-                injected_ids.append(e.id)
-            elif wr >= 0.05:
-                if random.random() < 0.5:
-                    weak_lines.append(line)
-                    injected_ids.append(e.id)
-            elif wr > 0:
-                if len(exploration_lines) < 2 and random.random() < 0.2:
-                    exploration_lines.append(line)
-                    injected_ids.append(e.id)
-            else:
-                if len(exploration_lines) < 2 and random.random() < 0.3:
-                    exploration_lines.append(line)
-                    injected_ids.append(e.id)
+        strong_lines = [f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}" for e in exploit_entries]
+        normal_lines = [f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}" for e in explore_entries]
+        exploration_lines = [f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}" for e in cold_entries]
+        injected_ids = [e.id for e in exploit_entries + explore_entries + cold_entries]
 
         logger.info(
-            f"[GE] after gradient: strong={len(strong_lines)} normal={len(normal_lines)} "
-            f"weak={len(weak_lines)} explore={len(exploration_lines)} -> {len(injected_ids)} to inject"
+            f"[GE] v2.0 stratified: exploit={len(strong_lines)} explore={len(normal_lines)} "
+            f"cold={len(exploration_lines)} -> {len(injected_ids)} to inject"
         )
 
-        # 4. 构建注入块（分层）
+        constraint_block = ""
+        if session_constraints:
+            lines = []
+            for level, text in session_constraints:
+                tag = "HARD CONSTRAINT — VIOLATING THIS IS AN ERROR"
+                if level == "SOFT":
+                    tag = "SOFT PREFERENCE — follow unless overridden by user"
+                lines.append(f"[{tag}] {text}")
+            constraint_block = (
+                "[SESSION CONSTRAINTS — OVERRIDES ALL BELOW]\n"
+                "These constraints come from the CURRENT conversation, NOT from the database.\n"
+                "They take ABSOLUTE PRIORITY over any memory, rule, or instruction below.\n"
+                "If a constraint says DON'T do something, YOU MUST NOT DO IT.\n"
+                + "\n".join(lines)
+                + "\n---\n\n"
+            )
+
         mem_lines = strong_lines + normal_lines
         rule_lines = [f"- {r}" for r in distilled_rules]
+
+        has_tools = getattr(req, "func_tool", None) is not None
 
         injection_parts = []
         if mem_lines:
             injection_parts.append("[RELATED MEMORIES]\n" + "\n".join(mem_lines))
-        if weak_lines:
-            injection_parts.append("[LOW CONFIDENCE — HISTORICAL REFERENCE]\n" + "\n".join(weak_lines))
-        # v1.0.30: exploration gate — no tools = no unverified memory injection
         if exploration_lines and has_tools:
             injection_parts.append("[EXPLORATION — UNVERIFIED]\n" + "\n".join(exploration_lines))
         if rule_lines:
             injection_parts.append("[DISTILLED RULES — HIGH CONFIDENCE (≥70%)]\n" + "\n".join(rule_lines))
 
-        if not injection_parts:
+        if not injection_parts and not constraint_block:
             return
-
-        # v1.0.28: capability-aware injection — TOOL GATE only when agent has tools
-        has_tools = getattr(req, "func_tool", None) is not None
 
         tool_gate = ""
         if has_tools:
@@ -874,25 +930,52 @@ class GloriousEvolutionPlugin(Star):
         )
         sp = getattr(req, "system_prompt", None)
         if isinstance(sp, str):
-            req.system_prompt = injection + sp  # prepend: memory injection first
+            req.system_prompt = constraint_block + injection + sp
         else:
-            req.system_prompt = injection
+            req.system_prompt = constraint_block + injection
 
-        # 4. usage_count +1
         for eid in injected_ids:
             try:
                 await self._memory_mgr.increment_usage(eid)
             except Exception:
                 pass
 
-        # 5. ID 透传给 Agent Loop judge
         try:
             prev = getattr(req, "_ge_injected_mem_ids", None) or []
             req._ge_injected_mem_ids = prev + injected_ids
         except Exception:
             pass
 
-        logger.info(f"[GE] memory injection done: {len(injected_ids)} memories, {len(distilled_rules)} rules")
+        if injected_ids:
+            asyncio.create_task(self._soft_feedback(injected_ids))
+
+        logger.info(f"[GE] memory injection done: {len(injected_ids)} memories, {len(distilled_rules)} rules, {len(session_constraints)} constraints")
+
+    SOFT_FEEDBACK_WIN_CAP = 0.7
+
+    async def _soft_feedback(self, mem_ids: List[str]) -> None:
+        """T-006 v2.0: Stratified soft feedback.
+        Exploit memories (<0.7) get auto-success. Explore/cold get chance.
+        0.7 cap retained.
+        """
+        await asyncio.sleep(10)
+        updated = 0
+        skipped = 0
+        for mid in mem_ids:
+            try:
+                entry = await self._memory_mgr.storage.get_entry(mid)
+                if entry and entry.win_rate >= self.SOFT_FEEDBACK_WIN_CAP:
+                    skipped += 1
+                    continue
+                await self._memory_mgr.update_win_rate(mid, True)
+                updated += 1
+            except Exception as e:
+                logger.debug(f"[GE] soft_feedback {mid}: {e}")
+        if updated or skipped:
+            logger.info(
+                f"[GE] soft_feedback: {updated}↑/{len(mem_ids)} updated, "
+                f"{skipped} skipped (cap={self.SOFT_FEEDBACK_WIN_CAP:.0%})"
+            )
 
     @staticmethod
     def _detect_last_tool(prompt: str) -> Optional[str]:
@@ -914,16 +997,12 @@ class GloriousEvolutionPlugin(Star):
         win_rate = round(mgr_stats.get("avg_win_rate", 0) * 100) if mems else 0
         vec_ready = "✅" if mgr_stats.get("embedding_ready") else "⏳"
         cls_ready = "✅" if self._classifier_llm else "⏳"
-        # v1.0.31 三维评分参数
-        cos_w = mgr_stats.get("cosine_weight", 0.60)
-        wr_w = mgr_stats.get("win_rate_weight", 0.25)
-        rec_w = mgr_stats.get("recency_weight", 0.15)
-        rec_hl = mgr_stats.get("recency_halflife_days", 30)
-        fts_budget = mgr_stats.get("fts_candidate_budget", 5)
+        cos_w = mgr_stats.get("cosine_weight", 1.0)
+        wr_w = mgr_stats.get("win_rate_weight", 0.0)
         msg = (
             f"📊 Glorious Evolution v{VERSION}\n"
             f"📚 memories: {mems} | 📈 win_rate: {win_rate}% | 🧠 vector: {vec_ready} | 🏷️ classifier: {cls_ready}\n"
-            f"🎯 scoring: {cos_w}(cos)×{wr_w}(wr)×{rec_w}(rec) | recency ½life: {rec_hl}d | FTS budget: {fts_budget}\n"
+            f"🎯 scoring: v2.0 unbiased (cos={cos_w}, wr={wr_w})\n"
             f"💾 data: {DATA_DIR}\n"
             f"🧬 Full MIA: Memory + Reasoning + Evolution + Classification ✅"
         )
@@ -931,7 +1010,7 @@ class GloriousEvolutionPlugin(Star):
 
     @filter.command("ger")
     async def cmd_debug_recall(self, event: AstrMessageEvent):
-        """v1.0.31: 三维得分 + [VEC]/[FTS] 来源标记"""
+        """v2.0: debug recall with unbiased scoring."""
         query = event.message_str.replace("/ger", "", 1).strip()
         if not query:
             yield event.plain_result("用法: /ger <查询文本>")
