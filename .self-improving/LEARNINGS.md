@@ -114,6 +114,13 @@ if injected_ids:
 - **瞬间激活**：重启后每说一句话就开始消化 pending 队列
 - **配合 ChatGPT 方案 A**：agent_loop 的精确判断 + 软反馈的广度覆盖 = 双轨并行
 
+### Metadata
+- Source: conversation + Gemini 建议 + ChatGPT 方案 A 结合
+- Related Files: main.py
+- Tags: feedback-loop, soft-feedback, pending-resolution, t-004
+- Pattern-Key: GE.soft_feedback.activation
+- See Also: ERR-20260507-001, MEM-20260507-114
+
 ---
 
 ## [LRN-20260508-003] best_practice — 分类器修复：LLM 驱动的记忆分类需要硬性规则，不能靠 LLM 自由裁量
@@ -201,18 +208,12 @@ v1.0.31 的三维评分 (0.6cos+0.25wr+0.15rec) 在检索阶段就引入 win_rat
 - Tags: v1.2, cold-start, auto-usage, soft-feedback-cap, eviction-logging
 - See Also: LRN-20260507-001
 
-### Metadata
-- Source: conversation + Gemini 建议 + ChatGPT 方案 A 结合
-- Related Files: main.py
-- Tags: feedback-loop, soft-feedback, pending-resolution, t-004
-- Pattern-Key: GE.soft_feedback.activation
-- See Also: ERR-20260507-001, MEM-20260507-114
 
 ## [LRN-20260504-002] knowledge_gap — AstrBot Internal Agent 模式下 ProviderRequest.prompt 为空
 
 **Logged**: 2026-05-04T21:12:00+08:00
 **Priority**: critical
-**Status**: pending
+**Status**: resolved (v1.0.22)
 **Area**: coding
 
 ### Summary
@@ -258,8 +259,8 @@ if len(query) <= 5:
 - v1.0.28 在此基础上引入能力感知路由，按 agent 工具能力分流注入规则
 - 单钩子方案代码更简洁、无状态同步问题、维护成本更低
 
-### 行动项
-- 实现两段式方案，解耦检索和注入
+### 备注
+- 两段式方案已评估但未采用 — 单钩子 + fallback 方案足够简洁有效
 - 查 AstrBot API 前必须先加载 skill-astrbot-dev → 读官方文档 → 再翻源码补充（不要反过来）
 
 ### Metadata
@@ -276,7 +277,7 @@ if len(query) <= 5:
 
 **Logged**: 2026-05-02T21:21:00+08:00
 **Priority**: high
-**Status**: pending
+**Status**: resolved (0dcac24 + efd9eb6)
 **Area**: coding
 
 ### Summary
@@ -308,3 +309,5 @@ pattern = '(' + var + ')\\s*:\\s*(\\S+)'
 - First-Seen: 2026-05-02
 - Last-Seen: 2026-05-02
 - See Also: ERR-20260502-001
+
+---
