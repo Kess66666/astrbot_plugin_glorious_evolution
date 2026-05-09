@@ -2,7 +2,9 @@
 光荣进化系统 - 数据模型
 MIA 风格的记忆条目定义 + Agent Loop 状态机
 
-v2.0: MemoryType 枚举完整 — CONSOLIDATED_RULE + INSIGHT
+v1.0.12: AgentLoopState 新增 used_memory_ids / used_neg_memory_ids
+v1.0.13: AgentLoopState 新增 used_memory_snippets（id→内容摘要），
+         支撑 judge 阶段按记忆粒度评价贡献度
 """
 
 import json
@@ -11,6 +13,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+
+# ── 记忆数据模型 ──
 
 class MemoryType(str, Enum):
     """记忆类型 — MIA 蓝图"""
@@ -43,6 +47,7 @@ class MemoryEntry:
     success_count: int = 0
     win_rate: float = 0.0
     embedding: Optional[List[float]] = None
+    embedding_version: str = ""
     tags: List[str] = field(default_factory=list)
     related_ids: List[str] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -74,6 +79,7 @@ class MemoryEntry:
             "success_count": self.success_count,
             "win_rate": self.win_rate,
             "embedding": embedding_str,
+            "embedding_version": self.embedding_version,
             "tags": json.dumps(self.tags),
             "related_ids": json.dumps(self.related_ids),
             "created_at": self.created_at,
@@ -113,6 +119,7 @@ class MemoryEntry:
             success_count=row.get("success_count", 0),
             win_rate=row.get("win_rate", 0.0),
             embedding=embedding,
+            embedding_version=row.get("embedding_version", ""),
             tags=tags,
             related_ids=related_ids,
             created_at=row.get("created_at", ""),
@@ -120,7 +127,10 @@ class MemoryEntry:
         )
 
 
+# ── Agent Loop 状态机 ──
+
 class Phase(str, Enum):
+    """Agent Loop 的固定阶段"""
     BUILD_PLAN = "BUILD_PLAN"
     EXECUTING = "EXECUTING"
     JUDGING = "JUDGING"
@@ -131,6 +141,7 @@ class Phase(str, Enum):
 
 
 class Action(str, Enum):
+    """Agent Loop 可执行的动作"""
     BUILD_PLAN = "BUILD_PLAN"
     EXECUTE_PLAN = "EXECUTE_PLAN"
     JUDGE_RESULT = "JUDGE_RESULT"
@@ -159,6 +170,7 @@ PHASE_TO_ACTION = {
 
 @dataclass
 class AgentLoopState:
+    """Agent Loop 当前状态（v1.0.13 加入记忆内容追踪以供 judge 评分）"""
     goal: str = ""
     max_iterations: int = 3
     iteration: int = 0
@@ -169,8 +181,10 @@ class AgentLoopState:
     result: str = ""
     error: str = ""
     done: bool = False
+    # v1.0.12: 反馈闭环 — 追踪本轮规划所用的记忆 ID
     used_memory_ids: List[str] = field(default_factory=list)
     used_neg_memory_ids: List[str] = field(default_factory=list)
+    # v1.0.13: 记忆内容摘要 — 传给 judge 做逐条贡献评分
     used_memory_snippets: Dict[str, str] = field(default_factory=dict)
 
     def to_display(self) -> str:

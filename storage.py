@@ -2,7 +2,12 @@
 光荣进化系统 - 存储层
 SQLite + FTS5 全文搜索 + 向量存储
 
-v1.0.32: FTS5 保留关键词过滤 (NOT/AND/OR/NEAR)
+v1.0.11 修复:
+- INSERT OR IGNORE → INSERT，冲突时抛异常而非静默丢数据
+- add_entry 检查 insert_entry 返回值
+- update_entry key 白名单校验，防 SQL 注入
+- 删除废弃的 storage.update_win_rate()（统一走 MemoryManager.update_win_rate）
+- insert_entry/add_entry 返回值语义修正
 """
 
 import asyncio
@@ -16,10 +21,11 @@ from astrbot.api import logger
 
 from .models import MemoryEntry, MemoryType, Judgement
 
+# update_entry 允许的字段白名单（防 SQL 注入）
 _ALLOWED_UPDATE_FIELDS = frozenset({
     "question", "content", "memory_type", "category", "judgement",
     "win_rate", "usage_count", "success_count", "trajectory", "rules",
-    "embedding", "tags", "related_ids", "updated_at",
+    "embedding", "embedding_version", "tags", "related_ids", "updated_at",
 })
 
 
@@ -33,11 +39,13 @@ class Storage:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._lock = asyncio.Lock()
+        # 确保父目录存在，避免 sqlite3.OperationalError: unable to open database file
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         logger.info(f"[GE] Storage db_path={db_path}, exists={os.path.exists(db_path)}")
         self._init_db()
 
     def _init_db(self) -> None:
+        """初始化数据库表（若不存在）。"""
         logger.info(f"[GE] _init_db connecting to: {self.db_path}")
         conn = sqlite3.connect(self.db_path)
         try:
@@ -59,6 +67,7 @@ class Storage:
                     trajectory TEXT NOT NULL DEFAULT '',
                     rules TEXT NOT NULL DEFAULT '',
                     embedding TEXT,
+                    embedding_version TEXT NOT NULL DEFAULT '',
                     tags TEXT NOT NULL DEFAULT '[]',
                     related_ids TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
@@ -96,12 +105,27 @@ class Storage:
                 );
             """)
             conn.commit()
+
+            # ── ALTER TABLE 兜底：为已有数据库补列 ──
+            try:
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN embedding_version TEXT NOT NULL DEFAULT ''"
+                )
+                conn.commit()
+                logger.info("[GE] ALTER TABLE: 已补列 embedding_version")
+            except sqlite3.OperationalError:
+                pass  # 列已存在，忽略
+
         finally:
             conn.close()
 
+    # ── ID 计数器恢复 ──
+
     def get_max_id_counter(self) -> int:
+        """从 SQLite 查询当前最大 ID 序号，用于 _id_counter 安全恢复。"""
         conn = sqlite3.connect(self.db_path)
         try:
+            # ID 格式: MEM-YYYYMMDD-NNN，取 NNN 部分的全局最大值
             row = conn.execute(
                 "SELECT id FROM memories WHERE id LIKE 'MEM-%' ORDER BY id DESC LIMIT 100"
             ).fetchall()
@@ -119,22 +143,27 @@ class Storage:
         finally:
             conn.close()
 
+    # ── CRUD ──
+
     async def insert_entry(self, entry: MemoryEntry) -> bool:
+        """插入一条记忆。ID 冲突时抛 IntegrityError 而非静默跳过。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
+                db_dict = entry.to_db_dict()
                 cursor = conn.execute(
                     """INSERT INTO memories
                        (id, question, content, memory_type, category, judgement,
                         win_rate, usage_count, success_count, trajectory, rules,
-                        embedding, tags, related_ids, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        embedding, embedding_version, tags, related_ids,
+                        created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         entry.id, entry.question, entry.content,
                         entry.memory_type.value, entry.category, entry.judgement.value,
                         entry.win_rate, entry.usage_count, entry.success_count,
                         entry.trajectory, entry.rules,
-                        entry.to_db_dict().get("embedding"),
+                        db_dict.get("embedding"), db_dict.get("embedding_version", ""),
                         json.dumps(entry.tags), json.dumps(entry.related_ids),
                         entry.created_at, entry.updated_at,
                     ),
@@ -149,12 +178,14 @@ class Storage:
                 conn.close()
 
     async def add_entry(self, entry: MemoryEntry) -> str:
+        """添加一条记忆，返回 entry_id。插入失败时记录错误日志。"""
         ok = await self.insert_entry(entry)
         if not ok:
             logger.error(f"[GE] add_entry 失败: {entry.id} 可能已存在")
         return entry.id
 
     async def get_entry(self, entry_id: str) -> Optional[MemoryEntry]:
+        """按 ID 获取单条记忆。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -168,8 +199,10 @@ class Storage:
                 conn.close()
 
     async def update_entry(self, entry_id: str, **fields) -> bool:
+        """按字段更新记忆条目。key 须在白名单内，否则拒绝。"""
         if not fields:
             return False
+        # ── 白名单校验：防止 SQL 注入 ──
         invalid_keys = set(fields.keys()) - _ALLOWED_UPDATE_FIELDS
         if invalid_keys:
             logger.error(f"[GE] update_entry 非法字段: {invalid_keys}")
@@ -192,6 +225,7 @@ class Storage:
                 conn.close()
 
     async def delete_entry(self, entry_id: str) -> bool:
+        """删除一条记忆。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -201,7 +235,10 @@ class Storage:
             finally:
                 conn.close()
 
+    # ── 评判 ──
+
     async def update_judgement(self, entry_id: str, judgement: Judgement) -> bool:
+        """更新评判状态。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -214,13 +251,18 @@ class Storage:
             finally:
                 conn.close()
 
+    # ── 搜索 ──
+
+    @staticmethod
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
         """净化 FTS5 查询字符串。
         v1.0.32: 过滤 FTS5 保留关键字 (NOT/AND/OR/NEAR)，短语查询包裹。
         """
         import re
+        # 去除用户输入中的引号
         safe = query.replace('"', '').replace("'", '')
+        # 剔除 FTS5 保留关键字（整词匹配，大小写不敏感）
         reserved = {'not', 'and', 'or', 'near'}
         terms = []
         for t in safe.split():
@@ -229,6 +271,7 @@ class Storage:
             terms.append(t)
         if not terms:
             return '""'
+        # 双引号包裹 = 短语查询，。等特殊字符不再报错
         return '"' + ' '.join(terms) + '"'
 
     async def search_entries(
@@ -238,6 +281,7 @@ class Storage:
         memory_type: Optional[str] = None,
         min_win_rate: float = 0.0,
     ) -> List[MemoryEntry]:
+        """FTS5 全文搜索 + 过滤"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -270,7 +314,10 @@ class Storage:
             finally:
                 conn.close()
 
+    # ── 批量读取 ──
+
     async def get_all_memories(self, limit: int = 1000) -> List[MemoryEntry]:
+        """获取所有记忆条目"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -290,10 +337,12 @@ class Storage:
         limit: int = 500,
         order_by: str = "created_at DESC",
     ) -> List[MemoryEntry]:
+        """按 memory_type 过滤获取记忆条目（SQL 层过滤，省内存）。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
                 conn.row_factory = sqlite3.Row
+                # 白名单校验 order_by，防 SQL 注入
                 allowed_orders = {
                     "created_at DESC", "created_at ASC",
                     "win_rate DESC", "win_rate ASC",
@@ -312,6 +361,7 @@ class Storage:
                 conn.close()
 
     async def get_entries_by_ids(self, entry_ids: List[str]) -> Dict[str, MemoryEntry]:
+        """按 ID 列表批量获取记忆条目，返回 {id: MemoryEntry} 映射。"""
         if not entry_ids:
             return {}
         async with self._lock:
@@ -334,7 +384,10 @@ class Storage:
             finally:
                 conn.close()
 
+    # ── 统计 ──
+
     async def get_statistics(self) -> Dict[str, Any]:
+        """获取统计快照"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -361,6 +414,8 @@ class Storage:
             finally:
                 conn.close()
 
+    # ── 蒸馏规则 CRUD (v1.0.14) ──
+
     async def insert_or_replace_distilled_rule(
         self,
         rule_id: str,
@@ -368,6 +423,7 @@ class Storage:
         source_memory_ids: str = "[]",
         avg_win_rate: float = 0.0,
     ) -> bool:
+        """插入或替换一条蒸馏规则。ID 冲突时 REPLACE。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -389,6 +445,7 @@ class Storage:
         min_win_rate: float = 0.0,
         limit: int = 15,
     ) -> List[Dict[str, Any]]:
+        """获取蒸馏规则列表，按 avg_win_rate 降序。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -413,6 +470,7 @@ class Storage:
         avg_win_rate: Optional[float] = None,
         source_memory_ids: Optional[str] = None,
     ) -> bool:
+        """更新蒸馏规则的部分字段。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -440,6 +498,7 @@ class Storage:
                 conn.close()
 
     async def delete_distilled_rule(self, rule_id: str) -> bool:
+        """删除一条蒸馏规则。"""
         async with self._lock:
             conn = sqlite3.connect(self.db_path)
             try:
