@@ -1,17 +1,24 @@
 """
 光荣进化系统 - LLM Tools（FunctionTool 子类）
 
-v2.0: consolidated_rule + insight in memory_type enum
+v1.0.12 修复:
+- 所有 Tool 的 run() → call()，签名对齐 AstrBot 框架约定
+- call(self, context: ContextWrapper, **kwargs) 避免 event/query 参数重复注入
+- 框架执行路径: handler → call override → run method
+  - call 方法: handler(context, **kwargs)  ✅ 正确
+  - run 方法: handler(event, **kwargs)      ❌ 旧写法导致 duplicate argument
 """
 
 from typing import Optional
 
 from astrbot.core.agent.tool import ContextWrapper, FunctionTool
 
+# ── 插件引用（由 main.py 注入） ──
 _plugin_cache: Optional["GloriousEvolutionPlugin"] = None
 
 
 def inject_plugin(plugin) -> None:
+    """由 main.py 在 plugin 启动时调用，注入插件实例。"""
     global _plugin_cache
     _plugin_cache = plugin
 
@@ -23,7 +30,12 @@ def _get_plugin() -> Optional["GloriousEvolutionPlugin"]:
     raise RuntimeError("GloriousEvolutionPlugin not initialized")
 
 
+# ── Tool 类定义（均用 call 实例方法，对齐框架内置工具签名） ──
+
+
 class StoreMemoryTool(FunctionTool):
+    """存储一条新记忆到知识库。"""
+
     def __init__(self):
         super().__init__(
             name="store_memory",
@@ -65,6 +77,8 @@ class StoreMemoryTool(FunctionTool):
 
 
 class SearchMemoryTool(FunctionTool):
+    """检索相关记忆。"""
+
     def __init__(self):
         super().__init__(
             name="search_memory",
@@ -101,6 +115,8 @@ class SearchMemoryTool(FunctionTool):
 
 
 class UpdateWinRateTool(FunctionTool):
+    """更新记忆胜率。"""
+
     def __init__(self):
         super().__init__(
             name="update_win_rate",
@@ -130,6 +146,8 @@ class UpdateWinRateTool(FunctionTool):
 
 
 class EvictMemoriesTool(FunctionTool):
+    """淘汰低质量记忆。"""
+
     def __init__(self):
         super().__init__(
             name="evict_memories",
@@ -147,6 +165,8 @@ class EvictMemoriesTool(FunctionTool):
 
 
 class GetEvolutionStatsTool(FunctionTool):
+    """获取进化系统统计信息。"""
+
     def __init__(self):
         super().__init__(
             name="get_evolution_stats",
@@ -173,6 +193,8 @@ class GetEvolutionStatsTool(FunctionTool):
 
 
 class TriggerEvolutionTool(FunctionTool):
+    """手动触发进化周期。"""
+
     def __init__(self):
         super().__init__(
             name="trigger_evolution",
@@ -193,6 +215,8 @@ class TriggerEvolutionTool(FunctionTool):
 
 
 class BuildPlanTool(FunctionTool):
+    """构建行动计划。"""
+
     def __init__(self):
         super().__init__(
             name="build_plan",
@@ -226,6 +250,8 @@ class BuildPlanTool(FunctionTool):
 
 
 class JudgeReplanTool(FunctionTool):
+    """判断是否需要重新规划。"""
+
     def __init__(self):
         super().__init__(
             name="judge_replan",
@@ -257,6 +283,8 @@ class JudgeReplanTool(FunctionTool):
 
 
 class BuildReplanTool(FunctionTool):
+    """构建修订计划。"""
+
     def __init__(self):
         super().__init__(
             name="build_replan",
@@ -286,7 +314,54 @@ class BuildReplanTool(FunctionTool):
         )
 
 
+class MergeMemoriesTool(FunctionTool):
+    """原子合并记忆（智能去重写入）。"""
+
+    def __init__(self):
+        super().__init__(
+            name="merge_memories",
+            description="Atomically merge a memory into the knowledge base. Checks for near-duplicates first; if a similar memory exists, updates its win_rate instead of creating a new entry. Use this to record successful solutions and learned lessons. Anti-pollution: rejects trivial/short content automatically.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question or problem this memory addresses.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The full memory content — answer, solution, code, or knowledge.",
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "enum": ["procedural", "declarative", "episodic", "consolidated_rule", "insight"],
+                        "description": "Memory type: procedural (steps/commands/how-to), declarative (facts/knowledge), episodic (events/conversations/logs), consolidated_rule, insight.",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["general", "debugging", "deployment", "coding", "configuration", "security", "insight", "consolidated_rule"],
+                        "description": "Category for organizing memories.",
+                    },
+                },
+                "required": ["question", "content"],
+            },
+        )
+
+    async def call(self, context: ContextWrapper, question: str, content: str, memory_type: str = "procedural", category: str = "general") -> str:
+        plugin = _get_plugin()
+        if not plugin or not plugin._memory_mgr:
+            return "❌ plugin not ready"
+        eid = await plugin._memory_mgr.merge_memories(
+            question=question, content=content, memory_type=memory_type, category=category,
+        )
+        if not eid:
+            return "⚠️ merge rejected (trivial content)"
+        return f"🧬 merged: {eid}"
+
+
 class RunAgentLoopTool(FunctionTool):
+    """运行 Agent 循环。"""
+
     def __init__(self):
         super().__init__(
             name="run_agent_loop",

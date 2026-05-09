@@ -4,6 +4,43 @@ Command failures and integration errors.
 
 ---
 
+## [ERR-20260509-001] memory_manager.py:94 `
+` escape rendered as literal newline
+
+**Logged**: 2026-05-09T21:38:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: coding
+
+### Summary
+插件重载报 `SyntaxError: unterminated string literal (detected at line 94)`。`memory_manager.py` 第 94 行 `text = entry.question + "
+" + entry.content` 中的 `
+` 转义序列被渲染为物理换行符，导致字符串断裂。
+
+### 根因
+文件编辑工具（`astrbot_file_edit_tool`）在前次修改时，将 `
+` 的 old/new 匹配字符串中的反斜杠+字母 n 错误替换为 ASCII 0x0A 换行符。编辑工具匹配时无法区分「字符串内的转义序列」和「真实的源码换行」，属于工具层面的转义陷阱。
+
+### 修复
+使用 Python 脚本直接读写字节流，`replace('"
+"', '"\
+"')` 将物理换行恢复为 `
+` 转义序列。编辑工具匹配失败后用 `sed` / `astrbot_execute_python` 兜底。
+
+### 模式关联
+- CLAUDE.md 编码红线第 4 条已预警（「编辑含转义字符的字符串时，禁止直接用文件编辑工具替换」）
+- 同类根因：LRN-20260502-001（rf-string 反斜杠问题）
+- **建议**：后续编辑含 `
+`、`	`、`\\` 等转义序列的代码时，优先用 `astrbot_execute_python` 整段重写，或使用 `astrbot_file_write_tool` 写入完整文件
+
+### Metadata
+- Reproducible: yes (file edit tool + escape sequence = 100% 触发)
+- Related Files: memory_manager.py L94
+- Source: reload 日志
+- See Also: CLAUDE.md 编码红线, LRN-20260502-001
+
+---
+
 ## [ERR-20260507-001] 97% memories stuck in pending — 反馈闭环断裂
 
 **Logged**: 2026-05-07T23:00:00+08:00
@@ -142,3 +179,4 @@ SyntaxError: f-string expression part cannot include a backslash
 - See Also: LRN-20260502-001
 
 ---
+
