@@ -42,7 +42,7 @@
 
 ## 关键约束
 
-1. **记忆注入**: `on_llm_request` 单钩子，prepend 到 `req.system_prompt` 最前面
+1. **记忆注入**: `on_llm_request` 单钩子，v2.1.0 起使用 `req.extra_user_content_parts.append(TextPart(...).mark_as_temp())`，不再 prepend 到 `req.system_prompt`。标记为 temp 的消息不持久化到 conversation history，不影响 provider 端 prompt cache 命中。
 2. **能力感知路由**: `has_tools = getattr(req, "func_tool", None) is not None`
    - 有工具 → 注入 TRUST BOUNDARY / RELEVANCE BUDGET / CONFLICT RESOLUTION + TOOL GATE + TOOL RESTRAINT
    - 无工具 → 仅注入 3 条基础规则，跳过工具指令
@@ -62,7 +62,7 @@
 13. **v1.0.33 T-004 软反馈闭环**: `_inject_relevant_memories` 出口调 `asyncio.create_task(self._soft_feedback(injected_ids))`。等 10 秒后 `update_win_rate(mid, True)`，零 Token 将 pending→correct。解决 97% pending 根因：feedback 闭环仅存在于 run_agent_loop（手动 Tool），普通对话路径从未触发。
 14. **v1.0.32 Bayesian 胜率平滑**: `update_win_rate()` 不再递增 usage_count，胜率公式从 `success_count / usage_count` 改为 `(success_count + 1) / (success_count + 2)`。消除"高频检索老记忆被分母碾死"问题（如 succ=2, use=273 → 0.7% → 75%）。pending 天然 50%，无需硬编码。后续加入 failure_count 后分母改为 `(success+failure+2)`。
 15. **v1.1.0 冷启动搜索修复**: `_add_vector(entry_id, embedding)` 曾硬编码 `win_rate=0.0`，导致新记忆向量 win_rate 为 0，搜索排序全部被已有记忆碾压，冷启动后完全搜不到新记忆。根因：`_add_vector` 签名漏掉了 win_rate 参数。修复：(a) `MemoryEntry` win_rate 初值从 0.0 → 0.5；(b) `_add_vector` 改为 `_add_vector(entry_id, embedding, win_rate)`，传入 `entry.win_rate`。同时 `_vector_search` 的向量四元组改回用 `_vectors[idx][1]`（wr=1.0 权重偏置已移除）。
-16. **v1.1.0 MemoryType 枚举补全**: 
+16. **v1.1.0 MemoryType 枚举补全**: `evolution_task.py` 的 `_consolidate()` 产生的 `consolidated_rule` 和 `_generate_insights()` 产生的 `insight` 在 `models.MemoryType` 枚举中缺失。`store_memory` 调用时触发 `ValueError`，导致进化周期 silent fail。修复：`models.py`/`tools.py`/`main.py` 三处补充 `CONSOLIDATED_RULE` 和 `INSIGHT`。
 17. **v1.1.1 淘汰三线保护**: 飞书早上实测：进化周期在评判数据严重缺失（2/65）时盲目淘汰 16 条，吞掉头部优质记忆。修复：(a) 数据充足门 — judged<10 跳过淘汰；(b) CORRECT 锁定 — 任何被判正确的记忆永不淘汰；(c) 两阶段 — 先清 INCORRECT+低用量垃圾，再走赢率底线。EVICT_MIN_USAGE 3→5，EVICT_MAX_WIN_RATE 0.2→0.1。根因：v1.0.32 Bayesian 后 win_rate 最低 0.5，旧时代残党（pre-Bayesian 的 0/100=0.0）成了无差别屠杀的受害者。
 18. **v1.2.0 四刀流防御体系** (2026-05-08):
     - 🛡️ **冷启动保护**: `run_evolution_cycle()` 入口双 gate — `total_success < 5` 跳过进化 + `judged_count < max(10, total*0.2)` 跳过淘汰。杜绝「还没学会打分就开删」。
@@ -72,7 +72,7 @@
     - 🚫 **DISABLE_AUTO_EVOLUTION = True**: 关闭自动进化，仅手动 `trigger_evolution`。
 19. **v2.0.0 无偏检索 + 分层注入** (2026-05-08): 检索阶段纯余弦评分 (cos=1.0, wr=0.0, rec=0.15)，消除 win_rate 偏见，公平海选 top-20。注入阶段分三桶 — exploit (wr高)、explore (wr中)、cold (wr低) — 每桶取 top-N + shuffle 保证曝光。T-006 `_soft_feedback` 升级为分层注入：exploit 直接提升，explore 给探索机会。70% 上限保留。
 20. **分类器修复** (2026-05-08): `classify_memory()` prompt 补充 `insight`（系统诊断/胜率分布/病灶识别）和 `consolidated_rule`（固化规则/最佳实践）定义，加硬性规则禁止将系统分析归类为 declarative。存量 19 条 `Insight:` 记忆已通过 SQL `UPDATE` 从 declarative 迁入 insight。迁移后分布：insight avg_wr=59.1%，declarative avg_wr=30.8%。
-19. **Soft Feedback 行为**: 注入记忆后 `asyncio.create_task(_soft_feedback(injected_ids))`，延迟 10s 后逐条检查 win_rate，<0.7 则 `update_win_rate(mid, True)` → Bayesian 平滑后涨一次分。`evolution_task.py` 的 `_consolidate()` 产生的 `consolidated_rule` 和 `_generate_insights()` 产生的 `insight` 在 `models.MemoryType` 枚举中缺失。`store_memory` 调用时触发 `ValueError: 'consolidated_rule' is not a valid MemoryType`，导致进化周期 silent fail。修复：`models.py`/`tools.py`/`main.py` 三处补充 `CONSOLIDATED_RULE` 和 `INSIGHT`。
+21. **Soft Feedback 行为**: 注入记忆后 `asyncio.create_task(_soft_feedback(injected_ids))`，延迟 10s 后逐条检查 win_rate，<0.7 则 `update_win_rate(mid, True)` → Bayesian 平滑后涨一次分。
 
 ## LLM Tools 清单
 
