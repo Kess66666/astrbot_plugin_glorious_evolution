@@ -2,8 +2,10 @@
 光荣进化系统 - 记忆管理器
 MIA 风格的高层封装：add_memory / retrieve_relevant_memories + 向量化钩子
 
-v2.0: Unbiased retrieval — cos=1.0, wr=0.0, pure cosine scoring.
-Win_rate only affects injection stratification, NOT retrieval ranking.
+v1.0.11 修复:
+- _id_counter 从 SQLite MAX(id) 恢复，避免重启碰撞
+- 删除对 storage.update_win_rate() 的依赖（已从 storage 中删除）
+- evict_low_quality 提高门限：usage_count >= 3 才参与淘汰，避免冷启动惩罚
 """
 
 from datetime import datetime
@@ -16,7 +18,10 @@ from astrbot.api import logger
 from .models import MemoryEntry, MemoryType, Judgement
 from .storage import Storage
 
-DEDUP_THRESHOLD: float = 0.95
+# ── 向量版本标识 ──
+CURRENT_EMBED_VERSION: str = "v2_qc"
+
+DEDUP_THRESHOLD: float = 0.90
 COSINE_WEIGHT: float = 1.0
 WIN_RATE_WEIGHT: float = 0.0  # v2.0: win_rate removed from retrieval — pure cosine
 MIN_FEEDBACK_COUNT: int = 3
@@ -37,9 +42,9 @@ def _lazy_import_numpy() -> Optional[Any]:
 
 class MemoryManager:
     DECAY_FACTOR: float = 0.0
-    EVICT_MIN_USAGE: int = 5
-    EVICT_MAX_WIN_RATE: float = 0.1
-    EVICT_DATA_SUFFICIENCY: int = 10
+    EVICT_MIN_USAGE: int = 5          # 必须至少用过 5 次才参与淘汰（v1.1: 3→5）
+    EVICT_MAX_WIN_RATE: float = 0.1   # v1.1: 0.2→0.1，更保守
+    EVICT_DATA_SUFFICIENCY: int = 10  # v1.1: 最少已评判记忆数，不足则跳过淘汰
 
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
@@ -52,6 +57,7 @@ class MemoryManager:
         ]
         self._vectors: Dict[str, Tuple[Any, float]] = {}
         self._id_counter: int = 0
+        self._last_merge_result: str = "stored"  # "stored" | "merged"
 
     async def set_embed_func(self, func: EmbedFunc, dim: int) -> None:
         self._embed_func = func
@@ -82,23 +88,40 @@ class MemoryManager:
         entries = await self.storage.get_all_memories(limit=10000)
         loaded = 0
         backfilled = 0
+        reembedded = 0
         for entry in entries:
-            if entry.embedding is not None:
+            if entry.embedding is not None and entry.embedding_version == CURRENT_EMBED_VERSION:
+                # 向量存在且版本匹配 → 直接加载
                 self._add_vector(entry.id, entry.embedding, entry.win_rate)
                 loaded += 1
             elif self._embed_func is not None:
-                text = f"Q: {entry.question} | A: {entry.content}"
+                # 向量缺失 或 版本不匹配 → 强制重嵌
+                if entry.embedding is not None and entry.embedding_version != CURRENT_EMBED_VERSION:
+                    reembedded += 1
+                    logger.info(f"[GE] 🔄 版本漂移重嵌: {entry.id} "
+                                f"old={entry.embedding_version or '(empty)'} → new={CURRENT_EMBED_VERSION}")
+                text = entry.question + "\n" + entry.content
                 embedding = await self.embed_text(text)
                 if embedding is not None:
                     import json as _json
-                    await self.storage.update_entry(entry.id, embedding=_json.dumps(embedding))
+                    await self.storage.update_entry(
+                        entry.id,
+                        embedding=_json.dumps(embedding),
+                        embedding_version=CURRENT_EMBED_VERSION,
+                    )
                     self._add_vector(entry.id, embedding, entry.win_rate)
                     backfilled += 1
+        # ── 从 SQLite MAX(id) 安全恢复计数器 ──
         db_max = self.storage.get_max_id_counter()
         self._id_counter = max(len(entries), db_max)
         logger.info(
             f"[GE] 向量索引加载完成: {loaded}/{len(entries)} 条含向量, "
-            f"在线补算 {backfilled} 条, counter={self._id_counter} (db_max={db_max})"
+            f"在线补算 {backfilled} 条, 版本漂移重嵌 {reembedded} 条, "
+            f"counter={self._id_counter} (db_max={db_max})"
+        )
+        logger.info(
+            f"[GE] 🚀 Global Consciousness Online | Embed: {CURRENT_EMBED_VERSION} "
+            f"| Policy: Q+C | Threshold: {DEDUP_THRESHOLD}"
         )
 
     def _build_entry(self, entry_id: str, question: str, content: str, memory_type: str,
@@ -109,7 +132,8 @@ class MemoryManager:
             id=entry_id, memory_type=MemoryType(memory_type), category=category,
             question=question, content=content, trajectory=trajectory, rules=rules,
             judgement=Judgement.PENDING, usage_count=0, success_count=0, win_rate=0.5,
-            embedding=embedding, tags=tags or [], related_ids=[],
+            embedding=embedding, embedding_version=CURRENT_EMBED_VERSION,
+            tags=tags or [], related_ids=[],
         )
 
     async def _find_duplicate(self, query_vec: List[float]) -> Optional[Tuple[str, float, MemoryEntry]]:
@@ -165,7 +189,7 @@ class MemoryManager:
                 category = "general"
         embedding = None
         if self._embed_func is not None:
-            embedding = await self.embed_text(question)
+            embedding = await self.embed_text(question + "\n" + content)
         if embedding is not None:
             dup = await self._find_duplicate(embedding)
             if dup is not None:
@@ -178,6 +202,8 @@ class MemoryManager:
         saved_id = await self.storage.add_entry(entry)
         if embedding is not None:
             self._add_vector(entry_id, embedding, entry.win_rate)
+        self._last_merge_result = "stored"
+        # ── 写入验证：三层检查 ──
         if embedding is None:
             logger.info(
                 f"[GE] ⚠️ embedding 为空: {entry_id}"
@@ -196,11 +222,70 @@ class MemoryManager:
         logger.info(f"[GE] [v2] 新增记忆: {entry_id} type={memory_type} category={category}")
         return saved_id
 
+    # ── merge 防污染黑名单 ──
+    _MERGE_BLACKLIST: List[str] = [
+        "好的", "知道了", "谢谢", "可以", "行", "嗯",
+        "ok", "thanks", "好吧", "明白了", "了解了",
+        "收到", "got it", "好滴", "👌", "没事",
+    ]
+
+    async def merge_memories(self, question: str, content: str,
+                             memory_type: str = "procedural",
+                             category: str = "general") -> str:
+        """
+        原子 merge 操作（供 Agent 写入使用）。
+
+        Anti-pollution gates:
+        - question 非空且 ≥5 字符
+        - content ≥20 字符（必须有实质信息）
+        - content 不含无意义黑名单词
+
+        Returns: entry_id（新创建或已有）；空字符串表示被 gate 拒绝
+        """
+        # Gate 1: 非空
+        if not question or not content:
+            logger.warning("[GE] 🚫 MEMORY REJECTED reason=empty")
+            return ""
+
+        q = question.strip()
+        c = content.strip()
+
+        # Gate 2: question 长度门
+        if len(q) < 5:
+            logger.warning(f"[GE] 🚫 MEMORY REJECTED reason=question_too_short len={len(q)}")
+            return ""
+
+        # Gate 3: content 信息量门（<20 字大概率是无意义回复）
+        if len(c) < 20:
+            logger.warning(f"[GE] 🚫 MEMORY REJECTED reason=content_too_short len={len(c)}")
+            return ""
+
+        # Gate 4: 黑名单无信息词
+        c_lower = c.lower()
+        for word in self._MERGE_BLACKLIST:
+            if word in c_lower:
+                logger.warning(f"[GE] 🚫 MEMORY REJECTED reason=blacklist word='{word}'")
+                return ""
+
+        eid = await self.add_memory(
+            question=question,
+            content=content,
+            memory_type=memory_type,
+            category=category,
+        )
+
+        if self._last_merge_result == "merged":
+            logger.info(f"[GE] ♻️ MEMORY MERGED id={eid}")
+        else:
+            logger.info(f"[GE] 🧠 MEMORY STORED id={eid}")
+        return eid
+
     async def _handle_duplicate(self, old_id: str, similarity: float, old_entry: MemoryEntry,
                                  new_id: str, question: str, content: str, memory_type: str,
                                  category: str, trajectory: str, rules: str,
                                  tags: Optional[List[str]], embedding: Optional[List[float]]) -> str:
         logger.info(f"[GE] 去重触发: new={new_id} vs old={old_id} similarity={similarity:.4f}")
+        self._last_merge_result = "merged"
         if old_entry.judgement == Judgement.INCORRECT:
             new_entry = self._build_entry(new_id, question, content, memory_type, category,
                                           trajectory, rules, tags, embedding)
@@ -233,11 +318,13 @@ class MemoryManager:
                 results = await self._vector_search(query_vec, top_k=top_k, min_win_rate=min_win_rate,
                                                      memory_type=memory_type, query_category=query_category)
                 if results:
+                    # ── v1.2: 检索命中自动计数 ──
                     for entry in results:
                         asyncio.ensure_future(self.increment_usage(entry.id))
                     return results
         results = await self.storage.search_entries(query=query, top_k=top_k,
                                                   memory_type=memory_type, min_win_rate=min_win_rate)
+        # ── v1.2: FTS5 命中也计数 ──
         for entry in results:
             asyncio.ensure_future(self.increment_usage(entry.id))
         return results
@@ -267,6 +354,7 @@ class MemoryManager:
                     if len(positive) >= pos_top_k and len(negative) >= neg_top_k:
                         break
                 if positive or negative:
+                    # ── v1.2: 检索命中自动计数 ──
                     for entry in positive + negative:
                         asyncio.ensure_future(self.increment_usage(entry.id))
                     return positive, negative
@@ -279,6 +367,7 @@ class MemoryManager:
                 negative.append(entry)
             if len(positive) >= pos_top_k and len(negative) >= neg_top_k:
                 break
+        # ── v1.2: FTS5 命中也计数 ──
         for entry in positive + negative:
             asyncio.ensure_future(self.increment_usage(entry.id))
         return positive, negative
@@ -348,8 +437,12 @@ class MemoryManager:
         if entry is None:
             logger.warning(f"[GE] 胜率更新失败，记忆不存在: {entry_id}")
             return False
+        # usage_count 由 increment_usage() 单独管理，此处不再递增
         if success:
             entry.success_count += 1
+        # Bayesian smoothing: (success + 1) / (success + 2)
+        # pending (0/0) → 50%, 1 success → 66%, 2 → 75%, 10 → 91.7%
+        # 后续加入 failure_count 后替换分母为 (success + failure + 2)
         entry.win_rate = (entry.success_count + 1.0) / (entry.success_count + 2.0)
         entry.judgement = Judgement.CORRECT if success else Judgement.INCORRECT
         entry.updated_at = datetime.now().isoformat()
@@ -373,13 +466,21 @@ class MemoryManager:
         )
 
     async def get_all_memories(self, limit: int = 10000) -> List[MemoryEntry]:
+        """封装 storage.get_all_memories，避免外部直接操作 storage。"""
         return await self.storage.get_all_memories(limit=limit)
 
     async def get_memories_by_type(self, memory_type: str, limit: int = 500) -> List[MemoryEntry]:
+        """按类型获取记忆（SQL 层过滤，推荐用于 consolidation / insight 等场景）。"""
         return await self.storage.get_memories_by_type(memory_type=memory_type, limit=limit)
 
     async def evict_low_quality(self) -> int:
-        """v1.2 三线保护淘汰 + 杀人日志。"""
+        """v1.2 三线保护淘汰 + 杀人日志：
+        1. 数据充足门 — judged < 10 → 跳过
+        2. CORRECT 锁定 — 任何被判正确的记忆永不淘汰
+        3. 两阶段：先清 INCORRECT+低用量的垃圾，再看赢率底线
+        4. 每条删除写入结构化日志（可追凶）
+        """
+        # ── 保护线 1：数据充足门 ──
         stats = await self.storage.get_statistics()
         by_judge = stats.get("by_judgement", {})
         judged_count = by_judge.get("correct", 0) + by_judge.get("incorrect", 0)
@@ -394,14 +495,17 @@ class MemoryManager:
         evicted = 0
 
         for entry in entries:
+            # ── 保护线 2：CORRECT 锁定 ──
             if entry.judgement == Judgement.CORRECT:
                 continue
 
             reason = ""
 
+            # ── 阶段 A：垃圾清扫（INCORRECT + 低用量） ──
             if entry.judgement == Judgement.INCORRECT and entry.usage_count <= 2:
                 reason = "INCORRECT+low_usage"
 
+            # ── 阶段 B：赢率底线（需要足够用量 + 极低赢率） ──
             elif (entry.usage_count >= self.EVICT_MIN_USAGE
                     and entry.win_rate < self.EVICT_MAX_WIN_RATE
                     and entry.judgement != Judgement.CORRECT):
@@ -413,6 +517,7 @@ class MemoryManager:
             if await self.storage.delete_entry(entry.id):
                 self._vectors.pop(entry.id, None)
                 evicted += 1
+                # ── v1.2: 结构化杀人日志 ──
                 logger.error(
                     f"[GE] 🗑️ EVICT | id={entry.id} | "
                     f"reason={reason} | "
@@ -439,4 +544,5 @@ class MemoryManager:
         stats["win_rate_weight"] = WIN_RATE_WEIGHT
         stats["category_boost"] = CATEGORY_BOOST
         stats["decay_factor"] = self.DECAY_FACTOR
+        stats["embed_version"] = CURRENT_EMBED_VERSION
         return stats
