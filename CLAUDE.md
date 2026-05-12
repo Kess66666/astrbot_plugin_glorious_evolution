@@ -5,7 +5,7 @@
 ## 项目身份
 
 - **名称**: astrbot_plugin_glorious_evolution
-- **版本**: v2.2.0-dev
+- **版本**: v2.4.1
 - **数据目录**: `/AstrBot/data/glorious_evolution/`（卸载安全）
 - **插件目录**: `/AstrBot/data/plugins/astrbot_plugin_glorious_evolution/`
 
@@ -13,10 +13,10 @@
 
 - **所有源码必须无 BOM UTF-8 保存**。GBK 残留（如 `0xb9`）会导致 `SyntaxError: (unicode error) 'utf-8' codec can't decode byte 0xb9`
 - 严禁从 Windows 剪贴板/GBK 编辑器直接粘贴代码到插件文件
-- 使用 `dev_write_file` 或 `astrbot_file_write_tool` 写入，确保 UTF-8 输出
-- **编辑含转义字符的字符串时，禁止直接用文件编辑工具替换 `
-` 等转义符**（会变成物理换行符导致语法错误）。改用 `chr(10)` / `chr(9)` 等运行时构造，或整段重写
+- **SAFE FILE EDIT POLICY (v2.1.0 铁律)**：插件核心文件（main.py / evolution_task.py / memory_manager.py / reasoning_engine.py / storage.py）**永远禁止**使用 `dev_write_file` 全量覆写。必须使用 `astrbot_file_edit_tool` 精准替换。`dev_write_file` 仅限新建 scaffold 使用。违反此规则已导致一次 plugin 脑死亡事故（evolution_task.py 被截断，文件头全丢，IndentationError）。
+- **编辑含转义字符的字符串时，禁止直接用文件编辑工具替换 `\n` 等转义符**（会变成物理换行符导致语法错误）。改用 `chr(10)` / `chr(9)` 等运行时构造，或整段重写
 - **修复代码后务必清 `__pycache__/`**，否则 .pyc 缓存可能掩盖修复
+- **修改后立即 `python3 -c "compile(...)"` 语法检查**，通过再 `dev_load_plugin`
 
 ## 常见反模式 + 排障
 
@@ -24,6 +24,7 @@
 |------|------|------|
 | 多个插件同时报各种无关错误 | 排在最前面的插件有语法错误，导致加载链中断 | 修第一个插件的语法错误 + 清 cache |
 | 插件日志无错误但 hook 不触发 | AstrBot LLM 管道未到达 `InternalAgentSubStage`（bot 无响应） | 先排查 bot 基础功能，再查 hook |
+| 某 hook 触发但另一 hook 不触发（同 plugin） | `plugins_name` 在不同 event stage 不一致（请求阶段 vs 工具循环阶段） | 查 snapshot `event_diff` 字段，对比 `plugins_name_first` vs `plugins_name_last` |
 | `_init_classifier()` 被 `asyncio.create_task` 包住 | 插件 initialize 返回太快，事件分发时 classifier 未就绪 | 改回 `await` 同步等待 |
 
 ## 架构速查
@@ -73,14 +74,13 @@
 19. **v2.0.0 无偏检索 + 分层注入** (2026-05-08): 检索阶段纯余弦评分 (cos=1.0, wr=0.0, rec=0.15)，消除 win_rate 偏见，公平海选 top-20。注入阶段分三桶 — exploit (wr高)、explore (wr中)、cold (wr低) — 每桶取 top-N + shuffle 保证曝光。T-006 `_soft_feedback` 升级为分层注入：exploit 直接提升，explore 给探索机会。70% 上限保留。
 20. **分类器修复** (2026-05-08): `classify_memory()` prompt 补充 `insight`（系统诊断/胜率分布/病灶识别）和 `consolidated_rule`（固化规则/最佳实践）定义，加硬性规则禁止将系统分析归类为 declarative。存量 19 条 `Insight:` 记忆已通过 SQL `UPDATE` 从 declarative 迁入 insight。迁移后分布：insight avg_wr=59.1%，declarative avg_wr=30.8%。
 21. **Soft Feedback 行为**: 注入记忆后 `asyncio.create_task(_soft_feedback(injected_ids))`，延迟 10s 后逐条检查 win_rate，<0.7 则 `update_win_rate(mid, True)` → Bayesian 平滑后涨一次分。
-22. **v2.2.0 embedding_version v2_qc** (2026-05-09): `CURRENT_EMBED_VERSION = "v2_qc"`, `MemoryEntry.embedding_version` 贯穿 models → storage → memory_manager 三端。`load_vectors()` 启动时版本匹配检查，不匹配的强制重嵌并写回 SQLite。ALTER TABLE 兜底为已有数据库补列 `embedding_version`。
-23. **语义统一 Q+C 协议** (2026-05-09): 向量化文本统一为 `question + "
-" + entry.content`，不再使用 `" | "` 拼接。embedding 向量空间从碎片化收敛到单一语义单元。
-24. **DEDUP_THRESHOLD 0.90** (2026-05-09): 去重阈值从 0.85 收紧至 0.90，减少误合并。
-25. **IntentGate v2.2.0** (2026-05-09): `_is_trivial_query()` 在 `_inject_relevant_memories` 入口拦截无意义短查询（≤8 字符且无实体/技术词/路径/英文），跳过向量检索，省 token。双重判断避免误杀技术短词。
-26. **版本日志锚点** (2026-05-09): `load_vectors()` 完成后打印 `[GE] 🚀 Global Consciousness Online | Embed: v2_qc | Policy: Q+C | Threshold: 0.90`，启动即可确认当前 embedding 策略。
-27. **交叉评审工作流** (2026-05-09): 重大架构决策前，ChatGPT + Gemini 双模型独立评审，分歧仲裁后由用户最终拍板。记录为 LEARNINGS best_practice。
-28. **三小弟流水线** (2026-05-09): a1(资深开发者) 写代码 → a2(安全/性能) 审逻辑 → a3(代码规范) 格式把关。小改动 a1 单独，大改动三级串联，审计走 project-audit。
+22. **v1.3 Rule Dedup (2026-05-10)**: `evolution_task.py` `_call_llm_and_store()` 新增存储前查重 — 对即将写入的 consolidated_rule 做向量检索，命中余弦相似度 > 0.82 的已有规则则合并源列表（`list(set(old_ids + new_ids))`），更新已有条目而非新建。杜绝同类规则膨胀（曾 11→7 条）。同时修正 `memory_type="declarative"` → `"consolidated_rule"`。
+23. **v2.1.0 SAFE FILE EDIT POLICY (2026-05-10)**: `dev_write_file` 只写函数体导致 evolution_task.py 文件头全丢 → IndentationError → plugin 脑死亡。事后修复：文件从 git HEAD 恢复 + `astrbot_file_edit_tool` 精修。教训：核心文件永不用全量覆写工具，只做精准 diff 替换。修改后必须 syntax check → reload。
+24. **v2.3.0 Fallback Exploration (2026-05-11)**: 查账发现 exploit 桶 90 条全活跃，explore 桶 6 条中 5 条 usage=0。根因：检索结果的马太效应——retrieve top-20 被 exploit 垄断，mid-wr 记忆永无曝光。修复：`_inject_relevant_memories` 增加 fallback — 当检索剩余结果中 mid_wr 为空时，直接从 DB 查全库 mid-wr 池，按 usage_count ASC 排序（新秀优先），强制注入 1 条 explore。日志标记 `fallback=True`。explore 配额从 2→1（精准扶贫）。
+25. **v2.4.0 Walkman 随身听 + 安全截断 (2026-05-11)**:
+    - 🎧 **Walkman**: `on_llm_tool_respond` hook 直接访问 `_ACTIVE_AGENT_RUNNERS`（AstrBot 私有 API）→ 绕过 `build_main_agent() return None` 时 hook 被跳过的问题。每次工具返回后向 `runner.run_context.messages[0].content`（system prompt）追加 1 条 mid-wr (0.2-0.7) explore 记忆，上限 3 轮。Per-session 互斥锁防竞态，round 计数防重复。解决 Tool-Loop Agent「只能看到 exploit 记忆」的问题。
+    - ✂️ **安全截断**: `_safe_truncate()` 截断到最近句号/换行边界（不低于 max_len 的 50%），并用正则滤除 `ignore previous instructions` 等 prompt injection 模式。记忆内容先过安全截断再注入 system prompt。
+26. **v2.4.1 Claude fallback (2026-05-12)**: explore 桶空时（mid_wr 检索为空且 v2.3 fallback 也失败），DB 硬捞 usage_count=0 的 mid-wr 记忆作为兜底。确保新记忆（从未被注入过）在检索通道全部耗尽时仍有机会首次曝光。解决「新生儿拿不到第一口奶」的恶性循环——冷门记忆因 usage=0 检索排布到底部，而检索 itself 也 never 把它们捞出来。
 
 ## LLM Tools 清单
 

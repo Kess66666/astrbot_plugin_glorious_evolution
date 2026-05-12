@@ -6,87 +6,31 @@ Corrections, insights, and knowledge gaps captured during development.
 
 ---
 
-## [LRN-20260509-001] best_practice — embedding_version: 从脚本系统升级到有生命周期管理的系统
+## [LRN-20260510-001] best_practice — SAFE FILE EDIT POLICY：核心文件禁止全量覆写
 
-**Logged**: 2026-05-09T23:00:00+08:00
+**Logged**: 2026-05-10T10:50:00+08:00
 **Priority**: critical
 **Status**: resolved
-**Area**: architecture
+**Area**: infra
 
 ### 问题
-修改 embedding 策略（如 Q+C 语义统一）后，旧向量与新向量存在于同一空间，余弦相似度无意义。以前唯一的做法是全库重嵌——灾难级操作。
-
-### 方案
-`CURRENT_EMBED_VERSION = "v2_qc"` 贯穿三端（models → storage → memory_manager）：
-1. `MemoryEntry.embedding_version` 字段记录创建时的版本
-2. `storage.py` ALTER TABLE 兜底补列
-3. `load_vectors()` 启动时版本匹配检查，不匹配的自动重嵌并写回 SQLite
-4. 启动日志明确打印当前版本和策略
+使用 `dev_write_file` 只写入函数体片段，未保留 imports/class 定义，导致 `evolution_task.py` 只剩半截函数体。`IndentationError: unexpected indent (line 1)`，插件加载链击穿。
 
 ### 核心洞察
-- **改 embedding 不再是全库重刷的灾难**，而是自动迁移
-- **调试从黑盒变成可观测**：启动日志一目了然
-- **迭代从高成本变低成本**：下次升级只需改 `CURRENT_EMBED_VERSION`
-- ChatGPT 评价：这就是"从脚本系统升级成有生命周期管理的系统"
+- **`dev_write_file` 是全量覆写工具**，不是局部编辑工具。传入非完整内容 = 文件截断。
+- **工具选择错误比代码错误更致命**：代码错了最多功能坏，工具选错了整个插件脑死亡。
+- **即使局部修改也要保证结构完整**：diff patch（`astrbot_file_edit_tool`） > 全量覆写（`dev_write_file`）
+
+### 制度成果
+CLAUDE.md 新增编码红线：
+> 插件核心文件（main.py / evolution_task.py / memory_manager.py / reasoning_engine.py / storage.py）**永远禁止**使用 `dev_write_file`。必须使用 `astrbot_file_edit_tool` 精准替换。修改后立即 `compile()` 语法检查 → `dev_load_plugin`。
 
 ### Metadata
-- Source: ChatGPT 评审
-- Related Files: models.py, storage.py, memory_manager.py
-- Tags: embedding, version, migration, infrastructure
-
----
-
-## [LRN-20260509-002] best_practice — 交叉评审工作流：ChatGPT + Gemini 双模型独立评审
-
-**Logged**: 2026-05-09T23:00:00+08:00
-**Priority**: high
-**Status**: active
-**Area**: workflow
-
-### 问题
-AI 有盲区——自己对架构设计的判断可能受限于单一模型的推理路径。Gemini 发现了 ChatGPT 遗漏的 DEDUP 阈值；ChatGPT 冷静地阻止了 Door 冲动大修 agent_loop。
-
-### 方案
-重大架构决策前：
-1. 提炼核心问题和候选方案
-2. 丢给 ChatGPT 和 Gemini 独立评审（不透露对方结论）
-3. 分歧点交叉验证，用户最终拍板
-4. 结论记录为 LEARNINGS best_practice
-
-### 核心洞察
-- 双模型交叉评审 ≈ 代码 review 的 AI 版本
-- Gemini 适合数据审计/边界扫描（发现 DEDUP 阈值过宽）
-- ChatGPT 适合架构冷静判断（阻止过早优化）
-- **分歧本身就是信号**——两个模型都同意的方向基本稳了
-
-### Metadata
-- Source: 本次会话 ChatGPT + Gemini 交叉评审
-- Related Files: 无代码变更（纯方法论）
-- Tags: workflow, review, cross-model, methodology
-
----
-
-## [LRN-20260509-003] best_practice — 三小弟流水线：按改动规模分级调用
-
-**Logged**: 2026-05-09T23:00:00+08:00
-**Priority**: medium
-**Status**: active
-**Area**: workflow
-
-### 方案
-- **小改动**（单文件、文案、格式）：a1 单独执行
-- **中等改动**（多文件、逻辑变更）：a1 写 + a3 规范把关
-- **大改动**（架构、新增模块、安全敏感）：a1 → a2(安全/性能审查) → a3(规范) 三级串联
-- **审计任务**：走 project-audit skill（整合 karpathy + tdd + diagnose + caveman）
-
-### 核心洞察
-- **不是每件事都要三级审查**——过度审查浪费 token
-- 每个小弟注入 `subagent-caveman` 砍 75% token
-- karpathy-guidelines 是常驻规则，无需每次注入
-
-### Metadata
-- Source: ChatGPT 建议 + Door 实践经验
-- Tags: subagent, pipeline, workflow, token-efficiency
+- Source: 2026-05-10 事故复盘 (ChatGPT + Gemini 共识)
+- Related Files: evolution_task.py, CLAUDE.md
+- Tags: safe-file-edit, dev_write_file, crash, infrastructure
+- Pattern-Key: GE.safe_file_edit_policy
+- See Also: ERR-20260510-001
 
 ---
 
@@ -113,13 +57,6 @@ if injected_ids:
 - **零 Token 成本**：不调 LLM，纯写库
 - **瞬间激活**：重启后每说一句话就开始消化 pending 队列
 - **配合 ChatGPT 方案 A**：agent_loop 的精确判断 + 软反馈的广度覆盖 = 双轨并行
-
-### Metadata
-- Source: conversation + Gemini 建议 + ChatGPT 方案 A 结合
-- Related Files: main.py
-- Tags: feedback-loop, soft-feedback, pending-resolution, t-004
-- Pattern-Key: GE.soft_feedback.activation
-- See Also: ERR-20260507-001, MEM-20260507-114
 
 ---
 
@@ -208,12 +145,18 @@ v1.0.31 的三维评分 (0.6cos+0.25wr+0.15rec) 在检索阶段就引入 win_rat
 - Tags: v1.2, cold-start, auto-usage, soft-feedback-cap, eviction-logging
 - See Also: LRN-20260507-001
 
+### Metadata
+- Source: conversation + Gemini 建议 + ChatGPT 方案 A 结合
+- Related Files: main.py
+- Tags: feedback-loop, soft-feedback, pending-resolution, t-004
+- Pattern-Key: GE.soft_feedback.activation
+- See Also: ERR-20260507-001, MEM-20260507-114
 
 ## [LRN-20260504-002] knowledge_gap — AstrBot Internal Agent 模式下 ProviderRequest.prompt 为空
 
 **Logged**: 2026-05-04T21:12:00+08:00
 **Priority**: critical
-**Status**: resolved (v1.0.22)
+**Status**: resolved
 **Area**: coding
 
 ### Summary
@@ -249,19 +192,18 @@ if len(query) <= 5:
 | `on_agent_begin` | 记忆检索（用 event.message_str 做 query，结果存 event.set_extra） | 直接注入 system_prompt（无 ProviderRequest） |
 | `on_llm_request` | 记忆注入（从 event.get_extra 读检索结果 → req.system_prompt +=） | 检索（每轮 tool 迭代都触发，效率低） |
 
-### 两段式方案（已评估，未采用 — 单钩子 + fallback 方案已足够）
-1. **on_agent_begin**: 用 `event.message_str` 检索记忆 → `event.set_extra("_ge_memories", data)`
-2. **on_llm_request**: 从 `event.get_extra("_ge_memories")` 读取 → 注入 `req.system_prompt`
-3. 签名须含 event：`async def on_agent_begin(self, event: AstrMessageEvent, run_context)` — 少 event 会 TypeError 参数错位（已踩坑验证）
-
 ### 实际采用方案（v1.0.22）
 - 单钩子 `on_llm_request` + 三级 query fallback: `req.prompt` → `event.message_str` → `req.contexts`
 - v1.0.28 在此基础上引入能力感知路由，按 agent 工具能力分流注入规则
 - 单钩子方案代码更简洁、无状态同步问题、维护成本更低
 
-### 备注
-- 两段式方案已评估但未采用 — 单钩子 + fallback 方案足够简洁有效
-- 查 AstrBot API 前必须先加载 skill-astrbot-dev → 读官方文档 → 再翻源码补充（不要反过来）
+### 两段式方案（已评估，未采用 — 单钩子 + fallback 方案已足够）
+1. on_agent_begin: 用 event.message_str 检索记忆 → event.set_extra("_ge_memories", data)
+2. on_llm_request: 从 event.get_extra("_ge_memories") 读取 → 注入 req.system_prompt
+3. 签名须含 event：`async def on_agent_begin(self, event: AstrMessageEvent, run_context)` — 少 event 会 TypeError 参数错位
+
+### Resolution
+- **Resolved**: v1.0.22 (query fallback) + v1.0.28 (capability router)
 
 ### Metadata
 - Source: code review + Angel Memory (kawayiYokami/astrbot_plugin_angel_memory) 对比
@@ -277,7 +219,7 @@ if len(query) <= 5:
 
 **Logged**: 2026-05-02T21:21:00+08:00
 **Priority**: high
-**Status**: resolved (0dcac24 + efd9eb6)
+**Status**: resolved
 **Area**: coding
 
 ### Summary
@@ -286,7 +228,7 @@ Python 3.12+ rf-string 内混用正则反斜杠（\s, \S, \d, \w）会触发解�
 ### Details
 两次在 Glorious Evolution 插件中触发同一问题：
 1. `reasoning_engine.py` — `rf"(\d+\.\s\*\*)"` 等模式，由 `0dcac24` 修复
-2. `tool_sanitizer.py` — `rf'("{key}")\\s*:\\s*"([^"]+)"'` 等 4 处，由 `efd9eb6` 修复
+2. `tool_sanitizer.py` — `rf'(\"{key}\")\\s*:\\s*\"([^\"]+)\"'` 等 4 处，由 `efd9eb6` 修复
 
 根本原因：Python 3.12 起 f-string 内不允许反斜杠出现在表达式部分。在 rf-string 中，正则元字符（\s, \S, \*, +）会让解析器误判为 f-string 转义，即便外层有 r 前缀也无法豁免。
 
@@ -300,6 +242,9 @@ pattern = rf'({var})\s*:\s*(\S+)'
 pattern = '(' + var + ')\\s*:\\s*(\\S+)'
 ```
 
+### Resolution
+- **Resolved**: reasoning_engine.py (0dcac24) + tool_sanitizer.py (efd9eb6)，共 4+ 处 rf-string 正则模式改为变量拼接
+
 ### Metadata
 - Source: error
 - Related Files: tool_sanitizer.py, reasoning_engine.py
@@ -309,5 +254,3 @@ pattern = '(' + var + ')\\s*:\\s*(\\S+)'
 - First-Seen: 2026-05-02
 - Last-Seen: 2026-05-02
 - See Also: ERR-20260502-001
-
----

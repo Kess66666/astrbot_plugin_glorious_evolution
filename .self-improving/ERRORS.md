@@ -4,8 +4,37 @@ Command failures and integration errors.
 
 ---
 
-## [ERR-20260509-001] memory_manager.py:94 `
-` escape rendered as literal newline
+## [ERR-20260510-001] dev_write_file 部分覆写导致 evolution_task.py 结构丢失 → IndentationError
+
+**Logged**: 2026-05-10T10:45:00+08:00
+**Priority**: critical
+**Status**: resolved
+**Area**: infra
+
+### Summary
+使用 `dev_write_file` 只写入函数体片段（查重逻辑），未保留文件头（imports/class定义），导致 `evolution_task.py` 只剩半截函数体。Python 解析器从第1行崩：`IndentationError: unexpected indent`。插件加载链击穿，所有插件被连坐失效。
+
+### 根因
+`dev_write_file` 是全量覆写工具，传入非完整文件内容 = 文件截断。属于**工具选择错误**——应用 `astrbot_file_edit_tool` 做精准 diff 替换。
+
+### 修复
+1. `git checkout HEAD -- evolution_task.py` 恢复完整文件
+2. 用 `astrbot_file_edit_tool` 重新插入查重逻辑
+3. `python3 -c "compile(...)"` 语法验证通过
+4. `dev_load_plugin` 重新加载
+
+### 制度修复
+CLAUDE.md 编码红线新增 **SAFE FILE EDIT POLICY**：核心文件永不用 `dev_write_file`。
+
+### Metadata
+- Reproducible: yes (dev_write_file + 非完整内容 = 100% 触发)
+- Related Files: evolution_task.py, CLAUDE.md
+- Source: reload 日志
+- See Also: SAFE FILE EDIT POLICY (CLAUDE.md)
+
+---
+
+## [ERR-20260509-001] memory_manager.py:94 `\n` escape rendered as literal newline
 
 **Logged**: 2026-05-09T21:38:00+08:00
 **Priority**: high
@@ -13,25 +42,18 @@ Command failures and integration errors.
 **Area**: coding
 
 ### Summary
-插件重载报 `SyntaxError: unterminated string literal (detected at line 94)`。`memory_manager.py` 第 94 行 `text = entry.question + "
-" + entry.content` 中的 `
-` 转义序列被渲染为物理换行符，导致字符串断裂。
+插件重载报 `SyntaxError: unterminated string literal (detected at line 94)`。`memory_manager.py` 第 94 行 `text = entry.question + "\n" + entry.content` 中的 `\n` 转义序列被渲染为物理换行符，导致字符串断裂。
 
 ### 根因
-文件编辑工具（`astrbot_file_edit_tool`）在前次修改时，将 `
-` 的 old/new 匹配字符串中的反斜杠+字母 n 错误替换为 ASCII 0x0A 换行符。编辑工具匹配时无法区分「字符串内的转义序列」和「真实的源码换行」，属于工具层面的转义陷阱。
+文件编辑工具（`astrbot_file_edit_tool`）在前次修改时，将 `\n` 的 old/new 匹配字符串中的反斜杠+字母 n 错误替换为 ASCII 0x0A 换行符。编辑工具匹配时无法区分「字符串内的转义序列」和「真实的源码换行」，属于工具层面的转义陷阱。
 
 ### 修复
-使用 Python 脚本直接读写字节流，`replace('"
-"', '"\
-"')` 将物理换行恢复为 `
-` 转义序列。编辑工具匹配失败后用 `sed` / `astrbot_execute_python` 兜底。
+使用 Python 脚本直接读写字节流，`replace('"\n"', '"\\n"')` 将物理换行恢复为 `\n` 转义序列。编辑工具匹配失败后用 `sed` / `astrbot_execute_python` 兜底。
 
 ### 模式关联
 - CLAUDE.md 编码红线第 4 条已预警（「编辑含转义字符的字符串时，禁止直接用文件编辑工具替换」）
 - 同类根因：LRN-20260502-001（rf-string 反斜杠问题）
-- **建议**：后续编辑含 `
-`、`	`、`\\` 等转义序列的代码时，优先用 `astrbot_execute_python` 整段重写，或使用 `astrbot_file_write_tool` 写入完整文件
+- **建议**：后续编辑含 `\n`、`\t`、`\\` 等转义序列的代码时，优先用 `astrbot_execute_python` 整段重写，或使用 `astrbot_file_write_tool` 写入完整文件
 
 ### Metadata
 - Reproducible: yes (file edit tool + escape sequence = 100% 触发)
@@ -177,6 +199,3 @@ SyntaxError: f-string expression part cannot include a backslash
 - Reproducible: yes
 - Related Files: tool_sanitizer.py, reasoning_engine.py
 - See Also: LRN-20260502-001
-
----
-

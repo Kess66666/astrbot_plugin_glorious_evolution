@@ -54,13 +54,29 @@ CHROMA_PATH = os.path.join(DATA_DIR, "chroma_db")
 EVO_STATS_FILE = os.path.join(DATA_DIR, "evolution_stats.json")
 MEMORY_FILE = os.path.join(DATA_DIR, "memory_store.json")
 
-VERSION = "2.2.0-dev"  # v2.2: IntentGate — 无意义短句跳过检索
+VERSION = "2.4.1"  # v2.4.1: Claude fallback — explore空桶时DB硬捞usage=0记忆
 DEFAULT_EVO_INTERVAL_HOURS = 6
 DISABLE_AUTO_EVOLUTION = True  # v1.2: 止血模式 — 禁自动进化，仅手动 trigger
 
 logger = logging.getLogger("GloriousEvolution")
 
 _plugin_cache: Optional["GloriousEvolutionPlugin"] = None
+
+
+def _safe_truncate(text: str, max_len: int = 200) -> str:
+    """v2.4.0: 安全截断 — 截到最近句号/换行 + 滤除 prompt injection 模式"""
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    last_safe = max(truncated.rfind("."), truncated.rfind("\n"), truncated.rfind("。"))
+    if last_safe > max_len * 0.5:
+        truncated = truncated[:last_safe + 1]
+    import re
+    truncated = re.sub(
+        r"(?i)(ignore|disregard|override)\s+(previous|above|all)\s+instructions?",
+        "[FILTERED]", truncated,
+    )
+    return truncated
 
 
 def _ensure_data_dir() -> None:
@@ -416,6 +432,12 @@ class GloriousEvolutionPlugin(Star):
         self._classifier_llm = None
         self._injection_stats: Dict[str, int] = {"exploit": 0, "explore": 0, "cold": 0, "skipped": 0}  # v2.2: +skipped
         self._injection_candidates: Dict[str, int] = {"exploit": 0, "explore": 0, "cold": 0}  # pre-cap counts
+        # v2.4.0: 随身听 — tool-loop 持续注入追踪
+        self._tool_loop_rounds: dict[str, int] = {}
+        self._tool_loop_injected_ids: dict[str, set] = {}
+        self._tool_loop_locks: dict[str, asyncio.Lock] = {}
+        self._tool_loop_ts: dict[str, float] = {}  # TTL 兜底
+        self._snapshot_event_plugins: list[list[str]] = []  # v2.3.1: 跨 stage plugins_name diff
         self._storage = Storage(DB_PATH)
         self._memory_mgr = MemoryManager(self._storage)
         self._reasoning_engine = ReasoningEngine(self._memory_mgr, context)
@@ -751,6 +773,7 @@ class GloriousEvolutionPlugin(Star):
         )
         self._injection_stats = {"exploit": 0, "explore": 0, "cold": 0, "skipped": 0}
         self._injection_candidates = {"exploit": 0, "explore": 0, "cold": 0}
+        self._snapshot_event_plugins = []
 
     async def _dump_evolution_snapshot(
         self, result: dict, duration_sec: float
@@ -797,10 +820,25 @@ class GloriousEvolutionPlugin(Star):
                 / total_inj, 3
             )
 
+            # event diff: compare plugins_name across on_llm_request calls
+            plugins_first = self._snapshot_event_plugins[0] if self._snapshot_event_plugins else []
+            plugins_last = self._snapshot_event_plugins[-1] if self._snapshot_event_plugins else []
+            plugins_uniq = []
+            for p in self._snapshot_event_plugins:
+                if p not in plugins_uniq:
+                    plugins_uniq.append(p)
+
             snapshot = {
                 "version": VERSION,
                 "timestamp": datetime.now(CST).isoformat(),
                 "duration_sec": duration_sec,
+                "event_diff": {
+                    "request_calls": len(self._snapshot_event_plugins),
+                    "plugins_name_first": plugins_first,
+                    "plugins_name_last": plugins_last,
+                    "plugins_name_all": plugins_uniq if len(plugins_uniq) <= 5 else f"{len(plugins_uniq)} unique sets",
+                    "changed": plugins_first != plugins_last,
+                },
                 "memory_counts": {
                     "total": total,
                     "consolidated": result.get("consolidated", 0),
@@ -838,7 +876,8 @@ class GloriousEvolutionPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        logger.debug(f"[GE] on_llm_request HOOK FIRED: prompt_len={len(getattr(req, 'prompt', '') or '')}")
+        logger.info(f"[GE] on_llm_request HOOK FIRED: prompt_len={len(getattr(req, 'prompt', '') or '')}")
+        self._snapshot_event_plugins.append(list(getattr(event, 'plugins_name', []) or []))
         if ENABLE_SANITIZATION:
             try:
                 sp = getattr(req, "system_prompt", None)
@@ -863,6 +902,101 @@ class GloriousEvolutionPlugin(Star):
             await self._inject_relevant_memories(event, req)
         except Exception as e:
             logger.error(f"[GE] memory injection failed (non-fatal): {e}", exc_info=True)
+
+    @filter.on_llm_tool_respond()
+    async def on_llm_tool_respond(self, event: AstrMessageEvent, tool, tool_args, tool_result):
+        """v2.4.0: 随身听 — 每次工具返回后注入explore记忆，确保Tool-Loop Agent能'看见'冷门记忆"""
+        logger.info("[GE] walkman: HOOK FIRED, tool=%s umo=%s", tool, event.unified_msg_origin)
+        # 防御性导入（私有 API 可能随上游变更消失）
+        try:
+            from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS as _runners
+        except ImportError:
+            logger.warning("[GE] _ACTIVE_AGENT_RUNNERS unavailable, walkman disabled")
+            return
+
+        umo = event.unified_msg_origin
+        runner = _runners.get(umo)
+        if not runner or not hasattr(runner, "run_context"):
+            return
+
+        lock = self._get_walkman_lock(umo)
+        async with lock:
+            rounds = self._tool_loop_rounds.get(umo, 0)
+            if rounds >= 3:
+                return
+
+            # 先计数再执行 → 异常/重复不重试同一 round
+            new_rounds = rounds + 1
+            self._tool_loop_rounds[umo] = new_rounds
+            self._tool_loop_ts[umo] = time.time()
+            self._walkman_cleanup_stale()
+
+            used_ids = self._tool_loop_injected_ids.get(umo, set())
+            try:
+                all_mem = await self._storage.get_all_memories(limit=200)
+                candidates = [
+                    e for e in all_mem
+                    if 0.2 <= e.win_rate <= 0.7 and e.id not in used_ids
+                ]
+                candidates.sort(key=lambda e: e.usage_count or 0)
+            except Exception:
+                logger.debug("[GE] walkman: fetch failed", exc_info=True)
+                return
+
+            if not candidates:
+                return
+
+            entry = candidates[0]
+            used_ids.add(entry.id)
+            self._tool_loop_injected_ids[umo] = used_ids
+
+            content_safe = _safe_truncate(entry.content, max_len=200)
+            block = (
+                "[GE TOOL-LOOP EXPLORE — ROUND %d]\n"
+                "Dynamically injected during tool loop. NOT in initial prompt.\n"
+                "- [%s] win=%.0f%%: %s\n"
+                "[INSTRUCTION] If relevant, incorporate. Otherwise ignore.\n"
+            ) % (new_rounds, entry.category, entry.win_rate * 100, content_safe)
+
+            msgs = runner.run_context.messages
+            MAX_SYSTEM = 8000
+            if msgs and msgs[0].role == "system" and len(msgs[0].content) + len(block) < MAX_SYSTEM:
+                msgs[0].content += "\n\n" + block
+                logger.info(
+                    f"[GE] walkman: round {new_rounds} → {entry.id} "
+                    f"win={entry.win_rate:.0%} cat={entry.category}"
+                )
+            elif msgs and msgs[0].role != "system":
+                logger.warning(
+                    f"[GE] walkman: messages[0].role={msgs[0].role}, skip inject"
+                )
+
+    def _get_walkman_lock(self, umo: str) -> asyncio.Lock:
+        """获取 per-session 互斥锁，防止同 umo 并发回调竞态"""
+        lock = self._tool_loop_locks.get(umo)
+        if not lock:
+            self._tool_loop_locks[umo] = asyncio.Lock()
+            lock = self._tool_loop_locks[umo]
+        return lock
+
+    def _walkman_cleanup_stale(self) -> None:
+        """TTL 兜底: 清理超过 1 小时未活跃的 walkman 追踪状态"""
+        now = time.time()
+        stale = [k for k, t in self._tool_loop_ts.items() if now - t > 3600]
+        for k in stale:
+            self._tool_loop_rounds.pop(k, None)
+            self._tool_loop_injected_ids.pop(k, None)
+            self._tool_loop_locks.pop(k, None)
+            self._tool_loop_ts.pop(k, None)
+
+    @filter.on_agent_done()
+    async def on_agent_done_cleanup(self, event: AstrMessageEvent, run_context, llm_response):
+        """v2.4.0: 正常结束时清理 tool-loop 追踪状态"""
+        umo = event.unified_msg_origin
+        self._tool_loop_rounds.pop(umo, None)
+        self._tool_loop_injected_ids.pop(umo, None)
+        self._tool_loop_locks.pop(umo, None)
+        self._tool_loop_ts.pop(umo, None)
 
     @staticmethod
     def _extract_session_constraints(contexts: list) -> list:
@@ -974,12 +1108,17 @@ class GloriousEvolutionPlugin(Star):
                         query = content
                         source = "req.contexts[user]"
                         break
+        # v2.3 diagnostic: log query state before gate checks
+        logger.info(f"[GE] pre-gate: query_len={len(query)}, source={source}, has_constraints={bool(session_constraints)}, trivial={self._is_trivial_query(query)}")
+
         if len(query) <= 2 and not session_constraints:
+            logger.info(f"[GE] GATE-BLOCKED: query too short ({len(query)} chars), no constraints — skipping injection")
             return
 
         # v2.2.0: IntentGate — 无意义短句跳过检索
         if self._is_trivial_query(query) and not session_constraints:
             self._injection_stats["skipped"] += 1
+            logger.info(f"[GE] GATE-BLOCKED: trivial query — skipping injection")
             return
 
         logger.info(f"[GE] inject start: query_len={len(query)}, source={source}, constraints={len(session_constraints)}")
@@ -1012,12 +1151,42 @@ class GloriousEvolutionPlugin(Star):
         mid_wr = [e for e in remaining if 0.2 <= e.win_rate <= 0.7]
         low_wr = [e for e in remaining if e.win_rate < 0.2]
 
+        # v2.3: Fallback exploration — 当检索结果被 exploit 垄断时，直接从 DB 拉 mid-wr 记忆
+        # 解决「语义贫富差距」：90条 exploit 挤占检索窗口，6条 explore 永无曝光
+        explore_from_fallback = False
+        if not mid_wr:
+            try:
+                all_memories = await self._storage.get_all_memories(limit=200)
+                mid_wr = [e for e in all_memories if 0.2 <= e.win_rate <= 0.7]
+                # 优先进 usage_count=0 的「新秀」（冷启动优先级）
+                mid_wr.sort(key=lambda e: e.usage_count or 0)
+                if mid_wr:
+                    explore_from_fallback = True
+                    logger.info(
+                        f"[GE] v2.3: explore fallback — DB mid-wr pool={len(mid_wr)}, "
+                        f"top={mid_wr[0].id} usage={mid_wr[0].usage_count or 0}"
+                    )
+            except Exception as e:
+                logger.debug(f"[GE] explore fallback query failed: {e}")
+
         # track pre-cap candidate distribution for snapshot
         self._injection_candidates["exploit"] += len(exploit_entries)
         self._injection_candidates["explore"] += len(mid_wr)
         self._injection_candidates["cold"] += len(low_wr)
 
-        explore_entries = mid_wr[:2]
+        explore_entries = mid_wr[:1]  # v2.3: 精确扶贫，1条足矣（2→1 防止塞太多未验证记忆）
+
+        # v2.4.1: Claude fallback — explore 桶空时，DB 硬捞 usage=0 的中等胜率记忆
+        if not explore_entries:
+            try:
+                all_mem = await self._storage.get_all_memories(limit=200)
+                fresh = [e for e in all_mem if 0.2 <= e.win_rate <= 0.7 and (e.usage_count or 0) == 0]
+                if fresh:
+                    explore_entries = [fresh[0]]
+                    logger.info("[GE] explore DB fallback (fresh): %s usage=0", fresh[0].id)
+            except Exception as e:
+                logger.debug("[GE] explore fallback failed: %s", e)
+
         cold_entries = low_wr[:1]
 
         strong_lines = [f"- [{e.category}] win={e.win_rate:.0%}: {e.content[:150]}" for e in exploit_entries]
@@ -1027,8 +1196,8 @@ class GloriousEvolutionPlugin(Star):
         injected_ids = [e.id for e in exploit_entries + explore_entries + cold_entries]
 
         logger.info(
-            f"[GE] v2.0 stratified: exploit={len(strong_lines)} explore={len(normal_lines)} "
-            f"cold={len(exploration_lines)} -> {len(injected_ids)} to inject"
+            f"[GE] v2.3 stratified: exploit={len(strong_lines)} explore={len(normal_lines)} "
+            f"cold={len(exploration_lines)} fallback={explore_from_fallback} -> {len(injected_ids)} to inject"
         )
         self._injection_stats["exploit"] += len(strong_lines)
         self._injection_stats["explore"] += len(normal_lines)
@@ -1062,6 +1231,7 @@ class GloriousEvolutionPlugin(Star):
         if weak_lines:
             injection_parts.append("[LOW CONFIDENCE — HISTORICAL REFERENCE]\n" + "\n".join(weak_lines))
         # v1.0.30: exploration gate — no tools = no unverified memory injection
+        has_tools = getattr(req, "func_tool", None) is not None
         if exploration_lines and has_tools:
             injection_parts.append("[EXPLORATION — UNVERIFIED]\n" + "\n".join(exploration_lines))
         if rule_lines:
@@ -1070,8 +1240,6 @@ class GloriousEvolutionPlugin(Star):
         if not injection_parts and not constraint_block:
             return
 
-        # v1.0.28: capability-aware injection — TOOL GATE only when agent has tools
-        has_tools = getattr(req, "func_tool", None) is not None
 
         tool_gate = ""
         if has_tools:
@@ -1144,6 +1312,8 @@ class GloriousEvolutionPlugin(Star):
         延迟 10 秒等 LLM 响应完成。
         """
         await asyncio.sleep(10)
+        # v2.3 diagnostic: log IDs at soft_feedback entry
+        logger.info(f"[GE] soft_feedback ENTRY: ids={mem_ids}")
         updated = 0
         skipped = 0
         for mid in mem_ids:
@@ -1154,6 +1324,7 @@ class GloriousEvolutionPlugin(Star):
                     continue
                 await self._memory_mgr.update_win_rate(mid, True)
                 updated += 1
+                logger.info(f"[GE] soft_feedback APPLIED: {mid}")
             except Exception as e:
                 logger.debug(f"[GE] soft_feedback {mid}: {e}")
         if updated or skipped:

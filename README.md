@@ -1,4 +1,4 @@
-# 光荣进化系统 v2.2.0-dev
+# 光荣进化系统 v2.4.1
 
 > MIA 风格的智能记忆与自改进框架 — AstrBot 插件
 
@@ -19,7 +19,7 @@ Models    → models.py                     (数据模型 + 状态机枚举)
 |------|------|
 | 记忆存储 + FTS5 全文搜索 | ✅ |
 | 向量化 (AstrBot EmbeddingProvider) | ✅ |
-| 去重 (余弦 ≥ 0.90) | ✅ |
+| 去重 (余弦 ≥ 0.95) | ✅ |
 | 正负分离检索 | ✅ |
 | 混合评分 (两阶段：检索纯余弦 + 注入分桶) | ✅ |
 | 胜率管理 (简单比值/衰减) | ✅ |
@@ -64,62 +64,117 @@ Models    → models.py                     (数据模型 + 状态机枚举)
 
 ## 更新日志
 
-### v2.2.0-dev — embedding_version + 语义统一 + IntentGate (2026-05-09)
-- 🧬 **embedding_version v2_qc**: MemoryEntry + SQLite + 内存向量索引三端贯穿，版本漂移自动重嵌
-- 🔗 **语义统一 Q+C 协议**: 每条记忆 question + newline + content 拼接后向量化，不再用 pipe 拼接
-- 🎯 **DEDUP_THRESHOLD 0.85→0.90**: 收紧去重阈值，减少误合并
-- 🚪 **IntentGate v2.2.0**: 无意义短句（≤8 字符无实体/技术词）跳过检索，省 token
-- 📋 **版本日志锚点**: load_vectors() 启动时打印 Global Consciousness Online 带版本/策略/阈值
-- 🤝 **交叉评审工作流**: ChatGPT + Gemini 双模型评审，分歧仲裁后执行
-- 🤖 **三小弟流水线**: a1 写代码 → a2 审逻辑 → a3 规范把关，按改动规模分级调用
+### v2.4.1 — Claude Fallback (2026-05-12)
+- 🧬 **Claude fallback**: explore 桶空时（mid_wr 检索为空且 v2.3 fallback 也失败），DB 硬捞 usage_count=0 的 mid-wr 记忆作为终极兜底，确保新生儿拿到首次曝光
+
+### v2.4.0 — Walkman 随身听 + 安全截断 (2026-05-11)
+- 🎧 **Walkman 随身听**: `on_llm_tool_respond` hook — Tool-Loop Agent 每轮工具返回后注入 1 条 mid-wr explore 记忆（上限 3 轮），解决工具链 Agent「看不见冷门记忆」问题。Per-session 互斥锁 + round 计数防重复
+- ✂️ **安全截断**: `_safe_truncate()` 截到最近句号/换行边界，同时滤除 prompt injection 模式（ignore previous instructions 等），防止记忆内容被注入攻击利用
+- 🔢 VERSION 常量升级至 "2.4.0"
+
+### v2.3.0 — Fallback Exploration（精准扶贫）(2026-05-11)
+- 🔍 **查账实锤**: exploit 桶 90 条全活跃，explore 桶 6 条中 5 条 usage=0
+- 🧠 **根因**: 检索马太效应 — top-20 被 exploit 垄断，mid-wr 记忆永无曝光（不是 IntentGate 问题，不是过早收敛）
+- 🩹 **修复**: `_inject_relevant_memories` 增加 fallback — 检索剩余结果中 mid_wr 为空时，直接查 DB mid-wr 池，usage_count ASC 排序（新秀优先），强制注入 1 条 explore
+- 📊 explore 配额: 2→1（精准扶贫，防止塞太多未验证记忆）
+- 📝 日志标记 `fallback=True`，可观测
+
+### v2.1.0 — 规则查重 + SAFE FILE EDIT POLICY (2026-05-10)
+- 🔄 **Rule Dedup**: `_call_llm_and_store` 存储前查重，余弦 >0.82 合并源列表到已有规则，杜绝同类规则膨胀（11→7 条）
+- 🏷️ **consolidated_rule 户口修正**: `memory_type` 从 `declarative` 改为 `consolidated_rule`
+- 🛡️ **SAFE FILE EDIT POLICY**: 核心文件禁用 `dev_write_file`，必须用 `astrbot_file_edit_tool` 精准替换。源于一次全量覆写事故（evolution_task.py 被截断 → IndentationError → plugin 脑死亡）
 
 ### v2.0.0 — 无偏检索 + 分层注入 + 分类器修复 (2026-05-08)
 - 🎯 **无偏检索**: 检索阶段 cos=1.0, wr=0.0, rec=0.15 — 纯余弦海选 top-20，杜绝 win_rate 挤占
 - 🪣 **分层注入**: 检索后按 wr 分 exploit/explore/cold 三桶，每桶取 top-N + shuffle
 - 🏷️ **分类器修复**: insight/consolidated_rule 定义补齐 + 硬性规则，避免系统诊断误入 declarative
-- 📊 **存量重分类**: 19 条 Insight 记忆从 declarative → insight，migration 后 insight avg_wr=59.1%
+- 📊 **存量重分类**: 19 条 Insight: 记忆从 declarative → insight，migration 后 insight avg_wr=59.1%
 - 🔄 **T-006 软反馈 v2.0**: 分层注入替代平铺注入，exploit 直接提升 + explore 给机会
 
 ### v1.2.0 — 四刀流防御体系 (2026-05-08)
 - 🛡️ 冷启动保护：进化入口双 gate（total_success<5 跳过，judged<20% 跳过淘汰）
 - 💉 自动造血：所有检索路径出口自动 usage++，不依赖外部调用
 - ⚠️ 0.7 软反馈上限（Gemini 建议）：自动加分天花板 0.7，防认知茧房
-- 🔪 可追凶淘汰日志：每条 EVICT 结构化输出
+- 🔪 可追凶淘汰日志：每条 EVICT 结构化输出 (id/type/win_rate/reason)
 - 🚫 DISABLE_AUTO_EVOLUTION 开关：关闭自动进化，仅手动触发
 
-### v1.1.1 — 淘汰三线保护
-- 🔒 数据充足门：已评判记忆 < 10 时跳过淘汰
+### v1.1.1 — 淘汰三线保护（飞书血案修复）
+- 🔒 数据充足门：已评判记忆 < 10 时跳过淘汰，杜绝数据饥荒下的盲目清洗
 - 🛡️ CORRECT 锁定：被判正确的记忆永不淘汰
-- 🗑️ 两阶段淘汰：先清垃圾再走赢率底线
+- 🗑️ 两阶段淘汰：先清垃圾（INCORRECT+低用量），再走保守赢率底线
 - 📐 参数收紧：EVICT_MIN_USAGE 3→5，EVICT_MAX_WIN_RATE 0.2→0.1
 
 ### v1.1.0 — 冷启动 + 进化引擎双重修复
-- 🧊 key_fix: _add_vector 不再硬编码 win_rate=0.0
-- 🧬 MemoryType 枚举补全：consolidated_rule / insight
+- 🧊 冷启动搜索修复：`_add_vector` 不再硬编码 win_rate=0.0，新记忆初始 win_rate=0.5 正常参与排序
+- 🧬 MemoryType 枚举补全：`consolidated_rule` / `insight` 纳入枚举，进化周期不再 silent fail
+- 🧹 清理僵尸备份文件
 
 ### v1.0.33 — T-004 软反馈闭环
-- 🔄 注入后异步标记成功，零 Token，pending→correct 转化率 100%
+- 🔄 在 `_inject_relevant_memories` 出口添加 `_soft_feedback`，每次注入后异步标记记忆为成功
+- ⚡ 零 Token 成本、零 LLM 参与，pending → correct 转化率 100%
+- 🎯 解决 97% pending 的反馈缺失根因
 
 ### v1.0.32 — Bayesian 胜率平滑
-- 📐 (success+1)/(success+2) 替代 success/usage
+- 📐 win_rate 公式从 `success_count / usage_count` 改为 `(success_count + 1) / (success_count + 2)`
+- 🩹 消除"高频检索老记忆被分母碾死"问题（总体 30% → 59.1%）
+- 🔧 移除 update_win_rate 中多余的 usage_count 递增（改由 increment_usage 单独管理）
 
 ### v1.0.31 — 三维统一评分
-- 📐 0.60cos + 0.25wr + 0.15rec，merge-before-rerank
+- 📐 检索评分公式：0.60·cos + 0.25·wr + 0.15·rec，合并重排序
+- 🗂️ FTS 统一评分 + merge-before-rerank
 
 ### v1.0.30 — Exploration Gate
-- 🚪 无工具 agent 不注入未验证记忆
+- 🚪 无工具 agent 模式下不注入未验证记忆，避免信号污染
 
 ### v1.0.29 — 可见度梯度
-- 🌈 二进制过滤 → 概率认知，低 wr 记忆 sampling 复现
+- 🌈 从「二进制过滤」升级到「概率认知」— 低 win_rate 记忆通过 sampling 获得复现机会
 
 ### v1.0.28 — 能力感知路由
-- 🧰 has_tools 检测 → 按能力注入不同规则
+- 🧰 `has_tools` 检测 → 有工具注入 TOOL GATE + TOOL RESTRAINT，无工具跳过
 
 ### v1.0.22 — Query Fallback 链
 - 🔗 三级 fallback：req.prompt → event.message_str → req.contexts[user]
+- 🐛 修复 Internal Agent 模式下 req.prompt="" 导致记忆注入从未触发的根因
 
 ### v1.0.13–v1.0.21 — 存储硬化 + 健康检查 + 备份
-- 🔒 全局数据目录 / 健康检查循环 / 自动备份轮转
+- 🔒 全局数据目录 `/AstrBot/data/glorious_evolution/`
+- 🏥 健康检查循环（30min 间隔，缺失文件告警）
+- 💾 自动备份 + 轮转清理
+- 🛡️ terminate 钩子取消所有后台任务
 
-### v1.0.12–v1.0.6 — 早期硬化
-- Tool call 签名对齐 / 存储层硬化 / 记忆闭环 / 执行监控 / 数据持久化 / ToolCallHook 脱敏 / 双存储割裂修复
+### v1.0.12 — Tool call 签名对齐
+- 🔧 所有 Tool 的 `run()` → `call()`，签名对齐 AstrBot 框架约定
+- 🛡️ 避免 event/query 参数重复注入导致的 duplicate argument 错误
+
+### v1.0.11 — 存储层硬化
+- 🔒 INSERT OR IGNORE → INSERT，冲突时抛异常而非静默丢数据
+- 🛡️ update_entry key 白名单校验，防 SQL 注入
+- 🔄 _id_counter 从 SQLite MAX(id) 恢复，避免重启碰撞
+- 📈 evict_low_quality 门限提高：usage_count ≥ 3 才参与淘汰
+- 🗑️ 删除废弃的 storage.update_win_rate()，统一走 MemoryManager
+
+### v1.0.10 — 记忆闭环
+- 🧠 on_llm_request 自动注入相关记忆到 system prompt
+- 📊 每次请求自动检索 top-3 相关记忆，注入格式化摘要
+
+### v1.0.9 — 执行监控硬化
+- 🔄 状态机驱动 Agent Loop (agent_loop.py)
+- 🛡️ 进化引擎并发保护 (asyncio.Lock + 信号量)
+- ⏱️ 单周期超时 300s，LLM 调用超时 30s
+- 📊 规模保护：合并最多 500 条候选，LLM 并发 ≤ 3
+- 🏥 健康检查循环（30 分钟间隔）
+
+### v1.0.8 — 数据持久化硬化
+- 🔒 数据目录迁移至 `/AstrBot/data/glorious_evolution/`
+- 💾 每次进化循环结束后自动备份到工作区
+- 🔄 插件终止时执行最终备份
+- 📦 旧路径数据自动迁移
+
+### v1.0.7 — ToolCallHook 脱敏
+- 🛡️ 拦截所有工具返回值中的敏感信息
+- 📊 NumPy 批量矩阵运算优化向量检索 10-50x
+
+### v1.0.6 — 双存储割裂修复
+- 🧠 SQLite 替代 JSON 作为主存储
+- 📈 FTS5 全文搜索
+- 🔍 向量索引批量加载
